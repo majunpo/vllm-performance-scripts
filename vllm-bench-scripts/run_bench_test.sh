@@ -163,7 +163,8 @@ COMMON_ARGS=(
   --random-range-ratio "$RANDOM_RANGE_RATIO"
   --request-rate inf
   --seed 0
-  --ignore_eos
+  --ignore-eos
+  --num-warmup 10  # 预热请求数量
 )
 
 ######################################
