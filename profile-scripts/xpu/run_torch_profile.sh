@@ -1,0 +1,152 @@
+#!/bin/bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+MODEL=${MODEL:-/models/Qwen3-32B}
+TP=${TP:-1}
+INPUT_LEN=${INPUT_LEN:-3500}
+OUTPUT_LEN=${OUTPUT_LEN:-10}
+BS=${BS:-1}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-8192}
+MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-32}
+KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-auto}
+CHUNKED_PREFILL=${CHUNKED_PREFILL:-1}
+PHASE=${PHASE:-all}
+PROFILE_STEPS=${PROFILE_STEPS:-20}
+SETTLE_STEPS=${SETTLE_STEPS:-2}
+SHUTDOWN_TIMEOUT=${SHUTDOWN_TIMEOUT:-120}
+LOG_DIR=${LOG_DIR:-./torch-profile-log}
+TRACE_ROOT=${TRACE_ROOT:-./torch-profile-trace}
+
+usage() {
+  cat <<EOF
+Usage: $0 [options]
+  -m, --model <path>             model path                (default: $MODEL)
+      --tp <n>                   tensor parallel size      (default: $TP)
+  -i, --input-len <n>            input length              (default: $INPUT_LEN)
+  -o, --output-len <n>           output length             (default: $OUTPUT_LEN)
+  -b, --bs <n>                   decode batch size         (default: $BS)
+      --max-model-len <n>                                  (default: $MAX_MODEL_LEN)
+      --max-num-batched-tokens <n>                         (default: $MAX_NUM_BATCHED_TOKENS)
+      --max-num-seqs <n>                                   (default: $MAX_NUM_SEQS)
+      --kv-cache-dtype <auto|fp8|fp8_e4m3|fp8_e5m2>        (default: $KV_CACHE_DTYPE)
+      --enable-chunked-prefill   打开 chunked prefill       (default: CHUNKED_PREFILL=$CHUNKED_PREFILL)
+      --no-chunked-prefill       关闭 chunked prefill（需 max-num-batched-tokens >= max-model-len）
+      --phase <all|prefill|decode-only>                    (default: $PHASE)
+      --profile-steps <n>        decode-only 窗口步数      (default: $PROFILE_STEPS)
+      --settle-steps <n>         decode-only 预热步数      (default: $SETTLE_STEPS)
+      --shutdown-timeout <sec>   worker shutdown/trace flush timeout (default: $SHUTDOWN_TIMEOUT)
+      --log-dir <path>           log directory             (default: $LOG_DIR)
+      --trace-root <path>        torch trace output root   (default: $TRACE_ROOT)
+      --check                    只做环境自检，不启动 profiling
+  -h, --help
+EOF
+}
+
+CHECK_ONLY=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -m|--model) MODEL=$2; shift 2 ;;
+    --tp) TP=$2; shift 2 ;;
+    -i|--input-len) INPUT_LEN=$2; shift 2 ;;
+    -o|--output-len) OUTPUT_LEN=$2; shift 2 ;;
+    -b|--bs) BS=$2; shift 2 ;;
+    --max-model-len) MAX_MODEL_LEN=$2; shift 2 ;;
+    --max-num-batched-tokens) MAX_NUM_BATCHED_TOKENS=$2; shift 2 ;;
+    --max-num-seqs) MAX_NUM_SEQS=$2; shift 2 ;;
+    --kv-cache-dtype) KV_CACHE_DTYPE=$2; shift 2 ;;
+    --enable-chunked-prefill) CHUNKED_PREFILL=1; shift ;;
+    --no-chunked-prefill) CHUNKED_PREFILL=0; shift ;;
+    --phase) PHASE=$2; shift 2 ;;
+    --profile-steps) PROFILE_STEPS=$2; shift 2 ;;
+    --settle-steps) SETTLE_STEPS=$2; shift 2 ;;
+    --shutdown-timeout) SHUTDOWN_TIMEOUT=$2; shift 2 ;;
+    --log-dir) LOG_DIR=$2; shift 2 ;;
+    --trace-root) TRACE_ROOT=$2; shift 2 ;;
+    --check) CHECK_ONLY=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+PYTHON_BIN=${PYTHON_BIN:-$(command -v python || command -v python3 || true)}
+if [[ -z $PYTHON_BIN || ! -x $PYTHON_BIN ]]; then
+  echo "[ERROR] PATH 中找不到 python/python3，请设置 PYTHON_BIN=<解释器绝对路径>" >&2
+  exit 1
+fi
+
+if [[ ! -d $MODEL ]]; then
+  echo "[ERROR] 模型路径不存在: $MODEL" >&2
+  exit 1
+fi
+
+if [[ $CHECK_ONLY -eq 1 ]]; then
+  echo "python       : $PYTHON_BIN"
+  echo "VIRTUAL_ENV  : ${VIRTUAL_ENV:-<unset>}"
+  echo "model        : $MODEL (ok)"
+  "$PYTHON_BIN" -c "import sys, torch, vllm
+print('sys.executable:', sys.executable)
+print('sys.prefix    :', sys.prefix)
+print('torch         :', torch.__version__)
+print('vllm          :', vllm.__version__)
+print('xpu available :', torch.xpu.is_available(), '| device_count:', torch.xpu.device_count())" 2>&1 | grep -v "^W[0-9]"
+  exit 0
+fi
+
+if [[ $CHUNKED_PREFILL != 0 && $CHUNKED_PREFILL != 1 ]]; then
+  echo "[ERROR] CHUNKED_PREFILL 只能是 0 或 1，当前为 '$CHUNKED_PREFILL'" >&2
+  exit 1
+fi
+if [[ $CHUNKED_PREFILL -eq 0 && $MAX_NUM_BATCHED_TOKENS -lt $MAX_MODEL_LEN ]]; then
+  echo "[ERROR] 关闭 chunked prefill 时需要 --max-num-batched-tokens ($MAX_NUM_BATCHED_TOKENS) >= --max-model-len ($MAX_MODEL_LEN)" >&2
+  exit 1
+fi
+
+CHUNKED_ARGS=()
+[[ $CHUNKED_PREFILL -eq 1 ]] && CHUNKED_ARGS+=(--enable-chunked-prefill)
+
+MODEL_NAME=$(basename "${MODEL%/}")
+KV_TAG=""
+[[ $KV_CACHE_DTYPE != auto ]] && KV_TAG="-kv${KV_CACHE_DTYPE}"
+TAG="${MODEL_NAME}-${PHASE}-in${INPUT_LEN}-out${OUTPUT_LEN}-bs${BS}-tp${TP}${KV_TAG}-$(date +%y%m%d-%H%M%S)"
+OUT_DIR="$TRACE_ROOT/$TAG"
+LOG_FILE="$LOG_DIR/torch-profile-log-$TAG.log"
+
+mkdir -p "$OUT_DIR" "$LOG_DIR"
+
+echo "[INFO] model     : $MODEL"
+echo "[INFO] in/out/bs : $INPUT_LEN / $OUTPUT_LEN / $BS (tp=$TP)"
+echo "[INFO] phase     : $PHASE"
+echo "[INFO] kv dtype  : $KV_CACHE_DTYPE"
+echo "[INFO] chunked   : $([[ $CHUNKED_PREFILL -eq 1 ]] && echo on || echo off)"
+echo "[INFO] shutdown  : ${SHUTDOWN_TIMEOUT}s"
+echo "[INFO] python    : $PYTHON_BIN"
+echo "[INFO] trace dir : $(realpath "$OUT_DIR")"
+echo "[INFO] log file  : $(realpath -m "$LOG_FILE")"
+
+export ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK:-0}
+export NEOReadDebugKeys=1
+export EnableImplicitConvertionToCounterBasedEvents=0
+
+"$PYTHON_BIN" run_auto_model_xpu-bs-decode-only.py \
+  --model "$MODEL" \
+  --tp "$TP" \
+  --max-model-len "$MAX_MODEL_LEN" \
+  --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
+  "${CHUNKED_ARGS[@]}" \
+  --max-num-seqs "$MAX_NUM_SEQS" \
+  --kv-cache-dtype "$KV_CACHE_DTYPE" \
+  --input-len "$INPUT_LEN" \
+  --output-len "$OUTPUT_LEN" \
+  --bs "$BS" \
+  --phase "$PHASE" \
+  --profile-steps "$PROFILE_STEPS" \
+  --settle-steps "$SETTLE_STEPS" \
+  --profiler torch \
+  --profile-dir "$OUT_DIR" \
+  --shutdown-timeout "$SHUTDOWN_TIMEOUT" \
+  2>&1 | tee -a "$LOG_FILE"
+
+echo "[INFO] torch traces: $(realpath "$OUT_DIR")"
