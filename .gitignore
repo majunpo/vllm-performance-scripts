@@ -1,3 +1,10 @@
 .venv/
 __pycache__/
 *.py[cod]
+
+# profiling artifacts
+unitrace-log/
+unitrace-trace/
+torch-profile-log/
+torch-profile-trace/
+profile_logs_*/
