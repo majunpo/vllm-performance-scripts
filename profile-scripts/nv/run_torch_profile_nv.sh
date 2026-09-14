@@ -121,6 +121,19 @@ if [[ $CHUNKED_PREFILL -eq 0 && $MAX_NUM_BATCHED_TOKENS -lt $MAX_MODEL_LEN ]]; t
   exit 1
 fi
 
+case "$PHASE" in
+  all|prefill|decode-only) ;;
+  *) echo "[ERROR] --phase 只能是 all|prefill|decode-only，当前为 '$PHASE'" >&2; exit 1 ;;
+esac
+if ! [[ $PROFILE_STEPS =~ ^[1-9][0-9]*$ ]]; then
+  echo "[ERROR] --profile-steps 必须是正整数，当前为 '$PROFILE_STEPS'" >&2
+  exit 1
+fi
+if ! [[ $SETTLE_STEPS =~ ^[0-9]+$ ]]; then
+  echo "[ERROR] --settle-steps 必须是非负整数，当前为 '$SETTLE_STEPS'" >&2
+  exit 1
+fi
+
 EXTRA_ARGS=()
 [[ $CHUNKED_PREFILL -eq 1 ]] && EXTRA_ARGS+=(--enable-chunked-prefill)
 [[ $ENFORCE_EAGER -eq 1 ]] && EXTRA_ARGS+=(--enforce-eager)
@@ -140,6 +153,7 @@ mkdir -p "$OUT_DIR" "$LOG_DIR"
 echo "[INFO] model     : $MODEL"
 echo "[INFO] in/out/bs : $INPUT_LEN / $OUTPUT_LEN / $BS (tp=$TP)"
 echo "[INFO] phase     : $PHASE"
+[[ $PHASE == decode-only ]] && echo "[INFO] steps     : profile=$PROFILE_STEPS settle=$SETTLE_STEPS"
 echo "[INFO] kv dtype  : $KV_CACHE_DTYPE"
 echo "[INFO] chunked   : $([[ $CHUNKED_PREFILL -eq 1 ]] && echo on || echo off)"
 echo "[INFO] CUDA graph: $([[ $ENFORCE_EAGER -eq 1 ]] && echo off || echo on)"
