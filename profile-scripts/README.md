@@ -9,7 +9,7 @@
 | 脚本 | 平台 | 用途 |
 | --- | --- | --- |
 | [`xpu/run_torch_profile.sh`](xpu/run_torch_profile.sh) | Intel XPU | 推荐的 torch profiler 入口，支持 `all`、`prefill`、`decode-only` |
-| [`xpu/run_unitrace.sh`](xpu/run_unitrace.sh) | Intel XPU | unitrace 入口，适合查看 SYCL、Level Zero 和 kernel 时间线 |
+| [`xpu/run_unitrace.sh`](xpu/run_unitrace.sh) | Intel XPU | unitrace 入口，适合查看 SYCL、Level Zero 和 kernel 时间线；同样支持三种 phase |
 | [`xpu/run_auto_model_xpu-bs-decode-only.py`](xpu/run_auto_model_xpu-bs-decode-only.py) | Intel XPU | Python 底层入口；支持 torch profiler 和 unitrace 控制 |
 | [`nv/run_torch_profile_nv.sh`](nv/run_torch_profile_nv.sh) | NVIDIA CUDA | NV torch profiler 入口，默认 CUDA graph |
 | [`nv/run_auto_model_nv-bs-decode-only.py`](nv/run_auto_model_nv-bs-decode-only.py) | NVIDIA CUDA | NV Python 底层入口；不支持 unitrace |
@@ -83,6 +83,8 @@ profile-scripts/xpu/torch-profile-trace/<tag>/
 profile-scripts/xpu/torch-profile-log/torch-profile-log-<tag>.log
 ```
 
+`<tag>` 形如 `<model>-<phase>-<xpugraph|eager>-in<N>-out<N>-bs<N>-tp<N>[-kv<dtype>]-<timestamp>`。
+
 ### 2.3 Prefill-only torch profile
 
 Prefill-only 建议关闭 chunked prefill，使 prompt 尽量在一个 scheduler step 内完成：
@@ -125,7 +127,7 @@ bash profile-scripts/xpu/run_torch_profile.sh \
 
 ### 3.1 使用 launcher 采集
 
-当前 `run_unitrace.sh` launcher 默认采集 `all` phase。下面用 `output_len=1` 采集 prefill：
+`run_unitrace.sh` 默认采集 `all` phase。下面用 `--phase prefill` 采集 prefill：
 
 ```bash
 ZE_AFFINITY_MASK=4,5,6,7 \
@@ -140,6 +142,7 @@ bash profile-scripts/xpu/run_unitrace.sh \
   --input-len 4096 \
   --output-len 1 \
   --bs 1 \
+  --phase prefill \
   --profiler xpu
 ```
 
@@ -149,6 +152,8 @@ bash profile-scripts/xpu/run_unitrace.sh \
 profile-scripts/xpu/unitrace-trace/<tag>/
 profile-scripts/xpu/unitrace-log/unitrace-log-<tag>.log
 ```
+
+`<tag>` 命名规则与 torch launcher 一致，同样包含 phase 和 graph 模式。
 
 launcher 已自动设置：
 
@@ -162,7 +167,28 @@ unitrace --start-paused
 
 ### 3.2 纯 decode unitrace
 
-当前 unitrace launcher 没有暴露 `--phase` 和 `--profile-steps`。需要纯 decode 时，直接包装 Python 入口：
+launcher 已暴露 `--phase`、`--profile-steps` 和 `--settle-steps`，直接使用即可：
+
+```bash
+ZE_AFFINITY_MASK=4,5,6,7 \
+UNITRACE_BIN=/opt/install/unitrace/bin/unitrace \
+bash profile-scripts/xpu/run_unitrace.sh \
+  --model /models/Qwen3-32B \
+  --tp 4 \
+  --max-model-len 8192 \
+  --max-num-batched-tokens 8192 \
+  --max-num-seqs 32 \
+  --enable-chunked-prefill \
+  --input-len 2048 \
+  --bs 32 \
+  --phase decode-only \
+  --profile-steps 10 \
+  --settle-steps 2 \
+  --profiler xpu \
+  --shutdown-timeout 120
+```
+
+若需要修改 `--unitrace-final-flush-seconds` 等 launcher 未暴露的参数，可直接包装 Python 入口：
 
 ```bash
 cd profile-scripts/xpu
@@ -204,7 +230,7 @@ XPU Python 脚本默认设置：
 VLLM_XPU_ENABLE_XPU_GRAPH=1
 ```
 
-torch profiler 通常保持 graph 开启。若 unitrace 中 graph replay 的 kernel 出现异常 device timestamp，可关闭 graph 后对照采集：
+torch profiler 通常保持 graph 开启。若 unitrace 中 graph replay 的 kernel 出现异常 device timestamp，可关闭 graph 后对照采集（两个 XPU launcher 都支持 `--enforce-eager`，trace 目录名会带 `eager`）：
 
 ```bash
 ZE_AFFINITY_MASK=0 \
@@ -234,12 +260,16 @@ Shell launcher 常用默认值：
 | `--max-num-seqs` | 32 | 最大并发序列数，必须不小于 `bs` |
 | `--kv-cache-dtype` | `auto` | 可选 `fp8`、`fp8_e4m3`、`fp8_e5m2` |
 | `CHUNKED_PREFILL` | 1 | launcher 默认开启 |
-| `--phase` | `all` | torch launcher 可修改 |
-| `--profile-steps` | 20 | `decode-only` 采集步数 |
-| `--settle-steps` | 2 | profiler 开启前的稳定步数 |
+| `--phase` | `all` | 三个 launcher 均支持 |
+| `--profile-steps` | 20 | `decode-only` 采集步数，必须为正整数 |
+| `--settle-steps` | 2 | profiler 开启前的稳定步数，非负整数 |
+| `--enforce-eager` | 关闭 | 关闭 XPU / CUDA graph capture |
+| `--ep` | 关闭 | MoE 模型的 expert parallel |
 | `--shutdown-timeout` | 120 秒 | 等待 worker 退出和 trace 落盘 |
 
 注意：`decode-only` 会自动计算生成 token 预算，因此忽略 `--output-len`。
+
+三个 launcher 的选项名称一致，且都会在启动 Python 前校验 `--phase` 取值、步数以及 `CHUNKED_PREFILL` / `ENFORCE_EAGER` / `ENABLE_EP` 开关。
 
 ## 5. Decode-only 原理与约束
 
@@ -397,6 +427,14 @@ UNITRACE_BIN=/path/to/unitrace
 ### `decode batch would shrink during profiling`
 
 提高 `--max-num-batched-tokens` 以缩短 prefill 排空过程，或降低 `--profile-steps`。
+
+### `--phase 只能是 all|prefill|decode-only`
+
+launcher 在启动 Python 前会校验 phase 取值，检查拼写。同理 `--profile-steps` 必须是正整数，`--settle-steps` 必须是非负整数。
+
+### unitrace trace 里仍然混着 prefill
+
+确认传入了 `--phase decode-only`。只用 `--start-paused` 只能跳过模型加载和 warmup，`all` phase 仍会把 prefill 采进去。
 
 ### Unitrace JSON 不完整
 
