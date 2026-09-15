@@ -8,3 +8,16 @@ unitrace-trace/
 torch-profile-log/
 torch-profile-trace/
 profile_logs_*/
+*profile_logs_*/
+*.pt.trace.json
+*.pt.trace.json.gz
+*.perfetto.json.gz
+
+# analysis output -- internal only, keep out of the public repo.
+# Use `git add -f` if a specific report should ever be published.
+perf-report.md
+xpu-vs-nv-comparison.md
+analyze_trace.txt
+analysis.txt
+gemm_shapes.txt
+profiler_out_*.txt
