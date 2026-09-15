@@ -6,7 +6,7 @@ argument-hint: '<xpu analyze_trace.txt> <nv analysis.txt> [--prompt-len N] [--ba
 
 # XPU vs NVIDIA Performance Comparison
 
-Turns two per-platform trace analyses into a single `xpu-vs-nv-comparison.md`
+Turns two per-platform trace analyses into a single `xpu-vs-nv-comparison-<YYMMDD-HHMMSS>.md`
 with side-by-side category tables, gap decomposition, and a prioritized
 optimization list for the slower platform.
 
@@ -59,8 +59,13 @@ python ./scripts/compare_perf.py \
     --nv  <path>/analysis.txt \
     --xpu-name "Intel Xe3" --nv-name "NVIDIA RTX PRO 5000" \
     --prompt-len 3500 --batch 1 \
-    -o xpu-vs-nv-comparison.md
+    -o xpu-vs-nv-comparison-<YYMMDD-HHMMSS>.md
 ```
+
+**Never overwrite an existing comparison report.** Always suffix the output with the
+XPU trace's timestamp (the `-<YYMMDD-HHMMSS>` tail of its trace directory, e.g.
+`xpu-vs-nv-comparison-260915-083118.md`). Earlier reports are kept as-is so two runs
+can be diffed. The script's default `-o` is unsuffixed — always pass `-o` explicitly.
 
 In this repo all five scripts are also symlinked into `profile-scripts/qwen3-perf-analysis/`,
 so they can be invoked from one place without knowing the skill layout.

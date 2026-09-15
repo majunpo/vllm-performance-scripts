@@ -1,4 +1,4 @@
-# xpu-vs-nv-comparison.md 结构模板
+# xpu-vs-nv-comparison-<YYMMDD-HHMMSS>.md 结构模板
 
 放在两个平台目录的共同父级（例如 `profile-scripts/`）。
 §1–§4 由 `compare_perf.py` 自动生成，其余需人工补充。
@@ -102,8 +102,11 @@ forward），计数为整数。
 python <repo>/.github/skills/xpu-nv-perf-comparison/scripts/compare_perf.py \
     --xpu <...>/analyze_trace.txt --nv <...>/analysis.txt \
     --xpu-name "..." --nv-name "..." --prompt-len N --batch N \
-    -o xpu-vs-nv-comparison.md
+    -o xpu-vs-nv-comparison-<YYMMDD-HHMMSS>.md
 ```
+
+> **命名约定**：文件名带上 XPU trace 的时间戳后缀，每次分析新 trace 都生成新文件，
+> 历史对比报告保留不覆盖。同时在此列出历史版本的链接。
 
 ### 各平台详细报告
 - <平台A>：[perf-report.md](<相对路径>)

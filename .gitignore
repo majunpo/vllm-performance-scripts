@@ -16,8 +16,10 @@ profile_logs_*/
 # analysis output -- internal only, keep out of the public repo.
 # Use `git add -f` if a specific report should ever be published.
 perf-report.md
-xpu-vs-nv-comparison.md
+xpu-vs-nv-comparison*.md
 analyze_trace.txt
+analyze_trace.err
 analysis.txt
 gemm_shapes.txt
+analyze_gemm_shapes.txt
 profiler_out_*.txt
