@@ -1,0 +1,1 @@
+../../.github/skills/qwen3-perf-analysis/scripts/make_perfetto_trace.py

@@ -1,0 +1,1 @@
+../../.github/skills/xpu-nv-perf-comparison/scripts/compare_perf.py

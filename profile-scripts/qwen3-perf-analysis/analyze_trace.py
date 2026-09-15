@@ -1,0 +1,1 @@
+../../.github/skills/qwen3-perf-analysis/scripts/analyze_trace.py
