@@ -55,11 +55,16 @@ python analyze_trace.py <trace>.json --num-layers 64 --batch 1 \
     --expected-output-len 20 --top 20 --max-name 92 > analyze_trace.txt
 
 # per-shape GEMM and attention: TFLOPS + achieved bandwidth
-python analyze_gemm_shapes.py <trace>.json --batch 1 --prompt-len 3500
+python analyze_gemm_shapes.py <trace>.json --batch 1 --prompt-len 3500 \
+  --weight-dtype mxfp8
 
 # Perfetto timeline -> drag the .json.gz into https://ui.perfetto.dev/
 python make_perfetto_trace.py <trace>.json --num-layers 64
 ```
+
+For an unquantized model (`quantization=None`, such as a BF16 checkpoint), pass
+`--weight-dtype bf16` instead. Otherwise the GEMM byte model undercounts weight
+traffic and reports an invalid achieved bandwidth.
 
 ### NVIDIA
 
@@ -77,9 +82,10 @@ definition, so their outputs can be compared row by row.
 Do not write the report until these pass. Each has caught a real bug before.
 
 1. **Single-step counts must be whole numbers**, and prefill must equal decode for
-   the per-layer categories: `Dense-GEMM = 4*layers + 1`, `Quantize = 4*layers`,
-   `Norm/RoPE = 4*layers + 1`, `Activation = layers`, `KVCache-Write = layers`.
-   A mismatch means the step window is clipped.
+  the per-layer categories: `Dense-GEMM = 4*layers + 1`,
+  `Norm/RoPE = 4*layers + 1`, `Activation = layers`, `KVCache-Write = layers`.
+  Quantized dense models additionally expect `Quantize = 4*layers`; unquantized
+  BF16 models expect `Quantize = 0`. A mismatch means the step window is clipped.
 2. **Single-step TOTAL ≈ aggregate ms/step** (within ~1%).
 3. **NV only**: single-step TOTAL ≈ the decode step period (start-to-start).
    If TOTAL is much larger, the split-K overlap is being double counted.
@@ -90,6 +96,13 @@ Do not write the report until these pass. Each has caught a real bug before.
 ## Step 3 — Write `perf-report.md`
 
 Put it next to the trace. Follow [the report template](./references/report-template.md).
+
+The exact prefill/decode tables are the core evidence. Copy every category from
+the script and expand each category into its kernel-name rows with `├` / `└`,
+including counts, milliseconds, percentages, and searchable ND-ranges. Do not
+replace these rows with a single "representative kernel" summary. If several
+linears share one kernel signature (common for BF16 oneDNN), combine that row and
+state that the per-shape section uses sequence-based attribution.
 
 ## Critical Pitfalls
 
@@ -103,6 +116,7 @@ number. Summary of the traps that produce plausible-but-wrong results:
 | DeepGEMM split-K reduce runs concurrently with its GEMM | NV decode inflated by ~30% |
 | NV `execute_context_*` annotation excludes lm_head + sampler | NV decode step under-counted by ~1.3 ms |
 | Run start anchored on first KV-write (mid layer 0) | prefill loses one qkv GEMM + 3 norm kernels |
+| Aggregate phase split anchored on first decode KV-write | decode layer-0 prefix is mislabeled as prefill; use sampler windows |
 | Unterminated kernels at trace stop | one event with `dur` ≈ 10^5 s dwarfs the run |
 | RoPE fused with q/k RMSNorm by torch.compile | cannot be reported separately; keep one `Norm/RoPE` bucket |
 

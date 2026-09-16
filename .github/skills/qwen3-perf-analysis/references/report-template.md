@@ -23,12 +23,12 @@
 <列出本 trace 命中的陷阱，见 references/pitfalls.md>
 
 ## 3. 分类时间统计
-### 3.1 PREFILL（<T> ms，<N> tokens）
+### 3.1 PREFILL（<T> ms，<N> tokens；sampler-window aggregate）
 <表格：类别 | cnt | total_ms | %>
-### 3.2 DECODE（<T> ms / <N> steps）
+### 3.2 DECODE（<T> ms / <N> complete steps；sampler-window aggregate）
 <表格：类别 | cnt | total_ms | % | ms/step | cnt/step>
-### 3.3 单个 prefill step 精确统计
-### 3.4 单个 decode step 精确统计（step #3，跳过 3 步 warmup）
+### 3.3 单个 prefill step 精确统计（标题写 TOTAL ms 和 kernel 总数）
+### 3.4 单个 decode step 精确统计（step #3，标题写 TOTAL ms 和 kernel 总数）
 <表格：类别 | cnt | ms | % | kernel（可直接在 trace 中搜索）>
 <每个类别下用 ├ └ 展开到具体 kernel>
 ### 3.5 分类说明
@@ -99,6 +99,10 @@
 ## 写作要求
 
 - **类别名沿用脚本输出**，不要自创或套用别处的分类。
+- **精确单步表必须完整展开脚本输出的 kernel 子项**，不能只写“代表 kernel”。同名
+  kernel 可以聚合成一行，但必须保留 count、ms、%、可搜索名称和 ND-range。
+- **聚合 phase split 必须使用 sampler-delimited complete windows**。若只能回退到
+  KV-write marker，必须标注 layer-0 边界近似，不得把聚合计数当作精确计数。
 - **对比表的行按其中一方耗时降序**，两张表保持同样的排序基准。
 - **kernel 列填完整可搜索的名字**（XPU 带 ND-range，NV 带模板参数），这是这张表最大的价值。
 - **加速比 = 慢方 ÷ 快方**，>1 表示后者快。<1 的行要显式标出是哪一方领先。

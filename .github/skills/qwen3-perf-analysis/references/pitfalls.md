@@ -68,11 +68,15 @@ qkv_proj **之后**。被裁掉的头部：
 （实测 99234 s、106488 s）。每个活跃队列一个。不剔除的话单个事件就能淹没整个 run。
 两边脚本都用 `--max-kernel-s`（默认 10 s）丢弃并打印警告。
 
-## 7. 聚合表的 `cnt/step` 是小数
+## 7. 聚合 phase 不能锚在第一个 decode KV-write
 
-聚合表用 `总数 ÷ 步数`，首尾步被截断所以除不尽（如 `5048/19 = 265.7`）。
-**做对比分析时一律用单步精确统计表**，其窗口以 sampler kernel 为边界，恰好一次完整
-forward，计数全为整数。
+KV-write 位于 layer 0 中段。若状态机等到第一个 decode KV-write 才从 prefill 切到
+decode，sampler 后、KV-write 前的 decode layer-0 前缀会被误记为 prefill。实测 BF16
+trace 因此把 2 个 GEMM、3 个 Norm/RoPE 等共 24 个 kernel（0.405 ms）多算到 prefill，
+导致 `Dense-GEMM=259`，而 sampler 精确窗口是正确的 257。
+
+聚合和单步统计都应使用 sampler-delimited complete windows。只有缺少 sampler marker
+时才回退到 KV-write 状态机，并明确标注边界是近似值。对比分析仍一律使用单步精确表。
 
 ## 8. 自动检测层数不可靠
 

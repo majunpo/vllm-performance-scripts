@@ -324,9 +324,8 @@ def step_windows(evlist):
 def report_step_detail(evlist, lo, hi, label, maxname):
     """Exact per-kernel breakdown of one forward pass, with kernel names.
 
-    The aggregate tables divide by the step count, which yields fractional
-    counts because the first and last step are clipped. One window holds
-    exactly one forward, so every count here is a whole number.
+    One sampler-delimited window holds exactly one forward, so every count here
+    is a whole number. The aggregate phase split uses the same windows.
     """
     cats = defaultdict(lambda: [0, 0.0])
     kern = defaultdict(lambda: [0, 0.0])
@@ -370,22 +369,36 @@ def report_single_step(evlist, batch, num_layers, want, maxname):
 def report_phase_split(evlist, batch, num_layers):
     """Category mix for prefill and decode separately.
 
-    The KV-write kernel's ND-range is the token count of the forward that is
-    running, so a grid equal to the batch size marks a decode forward.
+    Prefer sampler-delimited windows, which contain complete forwards. Falling
+    back to the KV-write marker is less exact because that kernel occurs in the
+    middle of layer 0 and assigns the decode prefix to prefill.
     """
     phases = {"prefill": defaultdict(lambda: [0, 0.0]),
               "decode": defaultdict(lambda: [0, 0.0])}
-    in_decode = False
-    kv_writes = 0
-    for ts, dur, name in evlist:
-        if name.startswith(SIG_STEP_MARKER):
-            g = RE_GRID0.search(name)
-            in_decode = bool(g) and int(g.group(1)) == batch
-            kv_writes += in_decode
-        slot = phases["decode" if in_decode else "prefill"][bucket(name)]
-        slot[0] += 1
-        slot[1] += dur
-    steps = kv_writes // num_layers
+    wins = step_windows(evlist)
+    if len(wins) > 1:
+        for step, (lo, hi) in enumerate(wins):
+            phase = "prefill" if step == 0 else "decode"
+            for _, dur, name in evlist[lo:hi]:
+                slot = phases[phase][bucket(name)]
+                slot[0] += 1
+                slot[1] += dur
+        steps = len(wins) - 1
+        print(f"\nphase split      : sampler windows "
+              f"(1 prefill + {steps} complete decode steps)")
+    else:
+        in_decode = False
+        kv_writes = 0
+        for _, dur, name in evlist:
+            if name.startswith(SIG_STEP_MARKER):
+                g = RE_GRID0.search(name)
+                in_decode = bool(g) and int(g.group(1)) == batch
+                kv_writes += in_decode
+            slot = phases["decode" if in_decode else "prefill"][bucket(name)]
+            slot[0] += 1
+            slot[1] += dur
+        steps = kv_writes // num_layers
+        print("\nphase split      : KV-write fallback (layer-0 boundary is approximate)")
 
     for ph in ("prefill", "decode"):
         b = phases[ph]

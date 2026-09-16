@@ -20,7 +20,7 @@ import ijson
 DECODE_KV_WRITE = "vllm::reshape_and_cache_flash_strided_kernel"
 # quantisation and its scale copies sit between a norm and the GEMM it feeds
 GLUE = ("vllm::per_token_group_quant_8bit", "CopyScalarFunc",
-        "elementwise_global_range_kernel")
+    "elementwise_global_range_kernel", "gemm_zero_fill")
 # first dimension of the ND-range, e.g. "...[SIMD32 {3500; 1; 1} {128; 1; 1}]"
 RE_GRID0 = re.compile(r"\[SIMD\d+ \{(\d+);")
 
@@ -48,14 +48,14 @@ MXFP8_BYTES = 1.0 + 1.0 / 32          # fp8 element + one uint8 E8M0 scale per 3
 BF16_BYTES = 2.0
 
 
-def layer_gemms(cfg):
+def layer_gemms(cfg, quantized=True):
     h, inter = cfg["hidden"], cfg["inter"]
     qkv_n = cfg["heads"] * cfg["head_dim"] + 2 * cfg["kv_heads"] * cfg["head_dim"]
     return {
-        "qkv_proj":  (h, qkv_n, True),
-        "o_proj":    (cfg["heads"] * cfg["head_dim"], h, True),
-        "gate_up":   (h, 2 * inter, True),
-        "down_proj": (inter, h, True),
+        "qkv_proj":  (h, qkv_n, quantized),
+        "o_proj":    (cfg["heads"] * cfg["head_dim"], h, quantized),
+        "gate_up":   (h, 2 * inter, quantized),
+        "down_proj": (inter, h, quantized),
         "lm_head":   (h, cfg["vocab"], False),
     }
 
@@ -215,6 +215,8 @@ def main():
     p.add_argument("--max-kernel-s", type=float, default=10.0)
     p.add_argument("--peak-bw", type=float, default=0.0,
                    help="device peak HBM bandwidth in GB/s, to print efficiency")
+    p.add_argument("--weight-dtype", choices=("mxfp8", "bf16"), default="mxfp8",
+                   help="linear weight dtype used by the bandwidth model")
     args = p.parse_args()
 
     evs = load(args.trace, args.max_kernel_s)
@@ -223,12 +225,15 @@ def main():
         sys.exit("no decode GEMMs matched -- wrong --batch?")
     steps = kv_writes / CFG["layers"]
 
-    shapes = layer_gemms(CFG)
+    quantized = args.weight_dtype == "mxfp8"
+    shapes = layer_gemms(CFG, quantized)
     m = args.batch
     order = ["qkv_proj", "o_proj", "gate_up", "down_proj", "lm_head"]
 
+    weights = ("MXFP8(e4m3, group=32, uint8 scale)" if quantized
+               else "BF16")
     print(f"model: hidden={CFG['hidden']} inter={CFG['inter']} layers={CFG['layers']} "
-          f"vocab={CFG['vocab']}  weights=MXFP8(e4m3, group=32, uint8 scale)")
+          f"vocab={CFG['vocab']}  weights={weights}")
     print(f"decode M = {m}")
 
     for t in sorted({tk for tk, _ in pre if tk > 0}):
