@@ -13,9 +13,9 @@ import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hybrid_common import (CATEGORY_ORDER, CFG, bucket, is_gemm, is_main_gemm,
-                           layer_kinds, load, split_graph_blocks, step_windows,
-                           ts_collapsed, walk_layers)
+from hybrid_common import (CATEGORY_ORDER, CFG, GDN_LINEARS, bucket, is_gemm,
+                           is_main_gemm, layer_kinds, load, split_graph_blocks,
+                           step_windows, ts_collapsed, walk_layers)
 
 
 def short(name, width):
@@ -32,11 +32,11 @@ def short(name, width):
     return f"{name[:head]}...{name[-30:]}{nd}"
 
 
-def tally(evlist):
+def tally(evlist, wd="mxfp4"):
     cats = defaultdict(lambda: [0, 0.0])
     kern = defaultdict(lambda: [0, 0.0])
     for _, dur, name in evlist:
-        c = bucket(name)
+        c = bucket(name, wd)
         cats[c][0] += 1
         cats[c][1] += dur
         kern[(c, name)][0] += 1
@@ -66,8 +66,8 @@ def print_categories(cats, title, total=None, per_step=0):
     print(line)
 
 
-def print_step_detail(evlist, label, maxname, gemm_tags=None):
-    cats, kern = tally(evlist)
+def print_step_detail(evlist, label, maxname, gemm_tags=None, wd="mxfp4"):
+    cats, kern = tally(evlist, wd)
     total = sum(v[1] for v in cats.values())
     if total <= 0:
         return
@@ -123,19 +123,22 @@ def print_layer_split(evlist, layers, label):
           f"{100.0:>6.2f}%")
 
 
-def sanity(evlist, layers, tags, phase, cfg):
+def sanity(evlist, layers, tags, phase, cfg, wd="mxfp4"):
     """Counts that must be exact; a mismatch means the window is clipped."""
     n_full = sum(1 for k, _, _ in layers if k == "full")
     n_gdn = sum(1 for k, _, _ in layers if k == "gdn")
-    cats, _ = tally(evlist)
+    cats, _ = tally(evlist, wd)
     want_full = cfg["layers"] // cfg["full_attention_interval"]
     want_gdn = cfg["layers"] - want_full
+    n_gdn_lin = len(GDN_LINEARS[wd])
+    n_quant = 0 if wd == "bf16" else n_gdn_lin * want_gdn + 4 * want_full
     checks = [
         ("gdn layers", n_gdn, want_gdn),
         ("full layers", n_full, want_full),
-        ("Dense-GEMM", cats["Dense-GEMM"][0], 5 * want_gdn + 4 * want_full + 1),
-        ("Quantize(mxfp4)", cats["Quantize(mxfp4)"][0], 5 * want_gdn + 4 * want_full),
-        ("Quant-scale cast", cats["Quant-scale cast"][0], 5 * want_gdn + 4 * want_full),
+        ("Dense-GEMM", cats["Dense-GEMM"][0],
+         n_gdn_lin * want_gdn + 4 * want_full + 1),
+        ("Quantize(mxfp4)", cats["Quantize(mxfp4)"][0], n_quant),
+        ("Quant-scale cast", cats["Quant-scale cast"][0], n_quant),
         ("Activation(SiLU)", cats["Activation(SiLU)"][0], cfg["layers"]),
         ("KVCache-Write", cats["KVCache-Write"][0], want_full),
         ("GDN-Norm/Gate", cats["GDN-Norm/Gate"][0], want_gdn),
@@ -164,11 +167,15 @@ def main():
     p.add_argument("--graph-block-min", type=int, default=64,
                    help="a timestamp shared by at least this many kernels is a "
                         "collapsed XPU-Graph replay")
+    p.add_argument("--weight-dtype", choices=("mxfp4", "bf16"), default="mxfp4",
+                   help="checkpoint weight dtype; bf16 has no Hadamard rotation "
+                        "or activation quantisation and fuses the GDN in_proj")
     p.add_argument("--max-name", type=int, default=96)
     p.add_argument("--no-detail", action="store_true")
     args = p.parse_args()
 
     cfg = CFG
+    wd = args.weight_dtype
     evs = load(args.trace, args.max_kernel_s)
     total_dur = sum(e[1] for e in evs)
     frac, worst = ts_collapsed(evs)
@@ -177,7 +184,7 @@ def main():
     print(f"model  : {cfg['name']}  layers={cfg['layers']} "
           f"(gdn={cfg['layers']-cfg['layers']//cfg['full_attention_interval']}, "
           f"full={cfg['layers']//cfg['full_attention_interval']}, "
-          f"interval={cfg['full_attention_interval']})")
+          f"interval={cfg['full_attention_interval']})  weights={wd}")
     print(f"kernels: {len(evs)}   sum-of-durations {total_dur/1e6:.3f} s")
     print(f"!! {frac*100:.1f}% of kernels share a start timestamp with another "
           f"(up to {worst} on one stamp).")
@@ -200,8 +207,8 @@ def main():
               f"inside the prefill window carry a collapsed graph timestamp and "
               f"belong to a\n!! decode replay that was submitted while the "
               f"prefill was still running. They are excluded from the prefill.")
-    players, ptags = walk_layers(pre, cfg)
-    sanity(pre, players, ptags, "PREFILL", cfg)
+    players, ptags = walk_layers(pre, cfg, wd)
+    sanity(pre, players, ptags, "PREFILL", cfg, wd)
 
     # ---- decode --------------------------------------------------------
     # pick a complete decode window: the modal kernel count
@@ -218,18 +225,18 @@ def main():
     dk = good[min(args.decode_step, len(good) - 1)]
     dlo, dhi = wins[dk]
     dec = list(evs[dlo:dhi])
-    dlayers, dtags = walk_layers(dec, cfg)
-    sanity(dec, dlayers, dtags, f"DECODE step #{dk}", cfg)
+    dlayers, dtags = walk_layers(dec, cfg, wd)
+    sanity(dec, dlayers, dtags, f"DECODE step #{dk}", cfg, wd)
 
     # ---- aggregate -----------------------------------------------------
-    pcats, _ = tally(pre)
+    pcats, _ = tally(pre, wd)
     ptotal = sum(v[1] for v in pcats.values())
     dagg = defaultdict(lambda: [0, 0.0])
     dtotal = 0.0
     for k in good:
         lo, hi = wins[k]
         for _, dur, name in evs[lo:hi]:
-            c = bucket(name)
+            c = bucket(name, wd)
             dagg[c][0] += 1
             dagg[c][1] += dur
             dtotal += dur
@@ -247,9 +254,10 @@ def main():
     print_layer_split(dec, dlayers, f"DECODE step #{dk}")
 
     if not args.no_detail:
-        print_step_detail(pre, "SINGLE PREFILL STEP (exact)", args.max_name, ptags)
+        print_step_detail(pre, "SINGLE PREFILL STEP (exact)", args.max_name,
+                          ptags, wd)
         print_step_detail(dec, f"SINGLE DECODE STEP #{dk} (exact)",
-                          args.max_name, dtags)
+                          args.max_name, dtags, wd)
 
 
 if __name__ == "__main__":

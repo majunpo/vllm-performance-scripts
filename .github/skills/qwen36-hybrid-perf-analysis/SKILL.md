@@ -60,6 +60,14 @@ python analyze_hybrid_gemm.py  $D/python.*.json --batch 1 --prompt-len 3300 \
 python make_hybrid_perfetto_trace.py $D/python.*.json
 ```
 
+For an **unquantized BF16 checkpoint** add `--weight-dtype bf16` to both analysis
+scripts. It switches the byte model to 2 B/element, drops the Hadamard and
+quantize sections, and uses the 4-linear GDN decomposition (a BF16 build fuses
+the GDN input projection, giving `4G + 4F + 1 = 257` Dense-GEMMs per forward
+instead of `5G + 4F + 1 = 305`). Running the same workload in both precisions is
+the strongest available check on any "the quantized path is slow" claim -- see
+pitfall 5.
+
 In this repo all four scripts are also symlinked into
 `profile-scripts/qwen36-hybrid-perf-analysis/`, so they can be run straight from
 the repo root without touching `.github/`. `hybrid_common.py` must stay next to
@@ -101,8 +109,8 @@ and `G = L - F` GDN layers:
 | quantity | expected |
 |---|---|
 | gdn layers / full layers | `G` / `F` |
-| `Dense-GEMM` | `5G + 4F + 1` (GDN has 5 linears, full has 4, plus `lm_head`) |
-| `Quantize(mxfp4)`, `Quant-scale cast` | `5G + 4F` |
+| `Dense-GEMM` | `5G + 4F + 1` quantized, `4G + 4F + 1` for BF16 (fused GDN in_proj) |
+| `Quantize(mxfp4)`, `Quant-scale cast` | `5G + 4F`, or `0` for BF16 |
 | `Activation(SiLU)` | `L` |
 | `KVCache-Write`, `FullAttn-OutGate` | `F` |
 | `GDN-Norm/Gate` | `G` |
@@ -160,12 +168,20 @@ therefore structural:
    `{128;4;1}` (prefill or `in_proj_ba`), `{32;2;8}` (`lm_head`), or
    `{64;8;1}` with grid[0] != 1 (decode). Everything else called `gemm_kernel`
    is an online rotation. Verified: 305 main GEMMs and 1168 (prefill) / 304
-   (decode) rotations per forward.
-2. **Which linear** — the fused Inductor kernel names delimit the layers:
-   `..._rms_norm_3` ends a layer and announces a **GDN** layer,
-   `..._rms_norm_mm_view_3` announces a **full-attention** layer. Inside a
-   layer the order is fixed, so the *k*-th main GEMM is the *k*-th entry of
-   `[qkvz, ba, out_proj, gate_up, down_proj]` or `[qkv, o_proj, gate_up, down_proj]`.
+   (decode) rotations per forward. A BF16 checkpoint has no rotation at all, so
+   under `--weight-dtype bf16` every `gemm_kernel` is a linear.
+2. **Which linear** -- from the kernel that *consumes* the GEMM's output, not
+   from its position in the layer: `SiLU` -> `gate_up`, input-norm ->
+   `down_proj`, post-attn norm / gate -> `o_proj` or `gdn_out_proj`, a GDN
+   kernel -> `in_proj*`, qk-norm/RoPE/KV-write -> `qkv_proj`, sampler ->
+   `lm_head`. Positional assignment breaks whenever the graph partitioner
+   rotates a forward pass, which it does: the BF16 decode window starts in the
+   middle of layer 0's MLP and layer 0's attention block lands after the final
+   norm.
+3. **GDN vs full layer** -- from the segment's contents (`gdn::` kernels vs
+   FMHA / KV-write). The MXFP4 build emits two distinct input-norm kernels for
+   the two layer types (`..._rms_norm_3` / `..._rms_norm_mm_view_3`) but the
+   BF16 build collapses them into one, so the marker name cannot be trusted.
 
 Cost models (`Hq`/`Hkv` query/kv heads, `D` head_dim, `L` KV length, `w` bytes
 per weight element = `1/2 + 1/32` for MXFP4, `2` for bf16):

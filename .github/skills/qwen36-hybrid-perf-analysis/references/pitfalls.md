@@ -239,3 +239,28 @@ CUTLASS-SYCL 在这棵树里只用于 MoE 的 grouped GEMM。MXFP8 则另有
    **这张表是判断"软件问题还是硬件上限"的标准做法**：同一块卡上有两条路径跑到了
    各自峰值的 83\u201388 %，只有一条停在 9\u201310 %，那就一定是软件问题。
    只有厂商峰值、没有同机实测参照时，不要下"已达硬件上限"的结论。
+
+5. **拿未量化版本的同负载 trace 做端到端对照（最终验证）**。孤立微基准会漏掉只有整模型
+   才暴露的开销。实测 BF16 版 Qwen3.6-27B（同设备、同 in3300/out20/bs1）：
+
+   | | MXFP4 | BF16 | |
+   |---|---:|---:|---|
+   | prefill GEMM | 116.3 TFLOPS | **229.8 TFLOPS（峰值 77 %）** | BF16 快 **1.98×** |
+   | decode GEMM | 311.6 GB/s | **790.4 GB/s（峰值 66 %）** | |
+   | decode / step | **53.64 ms** | 86.64 ms | MXFP4 快 1.61× |
+
+   微基准预测的 2.0\u20132.4× 被整模型的 1.98× 证实。**但孤立微基准会高估整模型带宽**：
+   单 shape 的 bf16 GEMV 有 950\u20131045 GB/s，整模型混合 shape 只有 790 GB/s。
+   写"若达到 X GB/s 能省多少"时，基准要用**整模型实测**，不要用单 shape 峰值 ——
+   本报告先前就因此把"换 BF16 后 decode 持平"算错了（实际慢 1.61×）。
+
+   对照 trace 还会暴露只存在于某一条路径的 bug：BF16 版有个
+   `triton_poi_fused_cat_4`，ND-range 在 prefill 和 decode 下完全相同
+   （`{164800;1;1}`），耗时与 token 数无关，在 decode 里占 21.9 %；MXFP4 版没有。
+   **不要把两条路径的差异一律归因于量化格式本身。**
+
+   注意两边的 Inductor kernel 名和 Linear 分解都会变，`hybrid_common.py` 的 marker 与
+   `CFG` 需要各自核对：BF16 版只有 **257** 个 Dense-GEMM（把 `in_proj_ba` 融进了
+   `in_proj`），且 GDN 与 full 层的 input-norm 合并成了同一个 `..._rms_norm_3`，
+   layer walker 需要改用别的判据。
+

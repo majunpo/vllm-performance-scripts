@@ -70,13 +70,50 @@ def derive(cfg=CFG):
     }
 
 
+def derive(cfg=CFG, weight_dtype="mxfp4"):
+    """Per-layer linear shapes (K, N, quantized) for both layer types.
+
+    The BF16 checkpoint keeps the GDN input projection as a single fused linear,
+    so it has 4 linears per GDN layer where the quantized one has 5.
+    """
+    q = weight_dtype != "bf16"
+    h, inter = cfg["hidden"], cfg["inter"]
+    hq, hkv, d = cfg["heads"], cfg["kv_heads"], cfg["head_dim"]
+    q_out = hq * d * (2 if cfg["attn_output_gate"] else 1)
+    kv_out = 2 * hkv * d
+    gk, gkd = cfg["gdn_k_heads"], cfg["gdn_k_dim"]
+    gv, gvd = cfg["gdn_v_heads"], cfg["gdn_v_dim"]
+    qkvz_n = 2 * gk * gkd + 2 * gv * gvd
+    ba_n = 2 * gv
+    shapes = {
+        # full-attention layer
+        "qkv_proj":  (h, q_out + kv_out, q),
+        "o_proj":    (hq * d, h, q),
+        "gdn_out_proj": (gv * gvd, h, q),
+        # shared MLP
+        "gate_up":   (h, 2 * inter, q),
+        "down_proj": (inter, h, q),
+        # head -- never quantized in either checkpoint
+        "lm_head":   (h, cfg["vocab"], False),
+    }
+    if q:
+        shapes["in_proj_qkvz"] = (h, qkvz_n, True)
+        shapes["in_proj_ba"] = (h, ba_n, True)
+    else:
+        shapes["in_proj"] = (h, qkvz_n + ba_n, False)
+    return shapes
+
+
 def layer_kinds(cfg=CFG):
     """['gdn', 'gdn', 'gdn', 'full', ...] following full_attention_interval."""
     k = cfg["full_attention_interval"]
     return ["full" if (i + 1) % k == 0 else "gdn" for i in range(cfg["layers"])]
 
 
-GDN_LINEARS = ["in_proj_qkvz", "in_proj_ba", "gdn_out_proj", "gate_up", "down_proj"]
+GDN_LINEARS = {
+    "mxfp4": ["in_proj_qkvz", "in_proj_ba", "gdn_out_proj", "gate_up", "down_proj"],
+    "bf16": ["in_proj", "gdn_out_proj", "gate_up", "down_proj"],
+}
 FULL_LINEARS = ["qkv_proj", "o_proj", "gate_up", "down_proj"]
 
 
@@ -84,15 +121,20 @@ FULL_LINEARS = ["qkv_proj", "o_proj", "gate_up", "down_proj"]
 # kernel name markers
 # --------------------------------------------------------------------------
 
-# torch.compile (Inductor) emits stable fused-kernel names; these are the
-# anchors the layer walker relies on.  Verified against the 260917 trace.
-M_NORM_IN_GDN = "triton_red_fused__to_copy_add_fused_add_rms_norm_3"
-M_NORM_IN_FULL = "triton_red_fused__to_copy_add_fused_add_rms_norm_mm_view_3"
-M_NORM_POST_ATTN = "triton_red_fused__to_copy_add_fused_add_rms_norm_mm_view_1"
-M_GDN_GATED_NORM = "triton_per_fused__to_copy_add_mean_mm_mul_pow_rsqrt_silu_view_0"
-M_FULL_OUT_GATE = "triton_poi_fused_mm_mul_sigmoid_view_0"
-M_SILU = "triton_poi_fused_mm_mul_silu_slice_view_2"
-M_GDN_ZEROS = "triton_poi_fused_zeros_4"
+# torch.compile (Inductor) renumbers its fused kernels when the graph changes,
+# so every marker below must match both the MXFP4 and the BF16 variant.  The
+# reliable way to re-derive them is to dump one decode window and find the
+# kernels whose per-forward counts are num_layers / G / F.
+#   MXFP4: ..._rms_norm_3 (gdn) and ..._rms_norm_mm_view_3 (full) are distinct
+#   BF16 : both collapse into ..._rms_norm_3, so the layer kind must come from
+#          the segment's contents instead of the marker name
+RE_NORM_IN = re.compile(r"_fused_add_rms_norm(_mm_view)?_3$")
+RE_NORM_POST = re.compile(r"_fused_add_rms_norm(_mm_view)?_1$")
+RE_GDN_GATED_NORM = re.compile(r"rsqrt_silu(_t)?_view_0$")
+RE_FULL_OUT_GATE = re.compile(r"fused_(mm_)?mul_sigmoid_view_0$")
+RE_SILU = re.compile(r"fused_(mm_)?mul_silu_slice(_view)?_2$")
+RE_GDN_STATE = re.compile(r"triton_poi_fused_zeros_[0-9]+$")
+RE_GDN_CAT = re.compile(r"triton_poi_fused_cat_[0-9]+$")
 
 RE_QK_NORM_ROPE = re.compile(
     r"triton_poi_fused_4$|triton_red_fused_5$|"
@@ -141,8 +183,13 @@ def is_gemm(name):
     return name.startswith("gemm_kernel")
 
 
-def is_main_gemm(name):
-    """Distinguish a model linear from a Hadamard-rotation matmul."""
+def is_main_gemm(name, weight_dtype="mxfp4"):
+    """Distinguish a model linear from a Hadamard-rotation matmul.
+
+    A BF16 checkpoint has no rotation_config, so every gemm_kernel is a linear.
+    """
+    if weight_dtype == "bf16":
+        return True
     nd = nd_range(name)
     if nd is None:
         return False
@@ -164,7 +211,7 @@ def is_tiny_gemm(name):
     return bool(nd) and nd[0] == (1, 1, 1) and nd[1] == (128, 4, 1)
 
 
-def bucket(full):
+def bucket(full, weight_dtype="mxfp4"):
     """Category taxonomy.  Order matters -- see references/pitfalls.md."""
     name = base_name(full)
     if RE_FMHA_REDUCE.search(name):
@@ -176,26 +223,27 @@ def bucket(full):
     if RE_GDN_DECODE.search(name):
         return "GDN-Attn(recurrent)"
     if is_gemm(name):
-        return "Dense-GEMM" if is_main_gemm(full) else "Hadamard-Rotation"
+        return "Dense-GEMM" if is_main_gemm(full, weight_dtype) else "Hadamard-Rotation"
     if RE_KVWRITE.search(name):
         return "KVCache-Write"
     if RE_QUANT.search(name):
         return "Quantize(mxfp4)"
     if RE_SCALE.search(name):
         return "Quant-scale cast"
-    if M_GDN_GATED_NORM in name:
+    if RE_GDN_GATED_NORM.search(name):
         return "GDN-Norm/Gate"
-    if M_FULL_OUT_GATE in name:
+    if RE_FULL_OUT_GATE.search(name):
         return "FullAttn-OutGate"
-    if M_SILU in name:
+    if RE_SILU.search(name):
         return "Activation(SiLU)"
-    if name.startswith(M_NORM_IN_GDN) or name.startswith(M_NORM_IN_FULL) \
-            or name.startswith(M_NORM_POST_ATTN) or "rms_norm" in name:
+    if RE_NORM_IN.search(name) or RE_NORM_POST.search(name) or "rms_norm" in name:
         return "Norm(RMS)"
     if RE_QK_NORM_ROPE.search(name):
         return "QK-Norm/RoPE"
-    if M_GDN_ZEROS in name:
+    if RE_GDN_STATE.search(name):
         return "GDN-State-Init"
+    if RE_GDN_CAT.search(name):
+        return "GDN-Concat(in_proj)"
     if RE_SAMPLE.search(name):
         return "Sampling"
     if RE_SCHED.search(name):
@@ -283,7 +331,7 @@ def ts_collapsed(evlist):
 # layer walker: assigns every main GEMM to a named linear
 # --------------------------------------------------------------------------
 
-def walk_layers(evlist, cfg=CFG):
+def walk_layers(evlist, cfg=CFG, weight_dtype="mxfp4"):
     """Segment one forward pass into decoder layers and label its GEMMs.
 
     Returns (layers, gemm_tags) where
@@ -292,53 +340,99 @@ def walk_layers(evlist, cfg=CFG):
 
     The decoder emits a fixed kernel order which the Inductor fusion names make
     unambiguous:
-      gdn  : [H,quant x2 -> zeros] -> qkvz, ba -> conv1d -> delta-rule
-             -> gated-norm -> H,quant -> out_proj -> post-norm -> H,quant
-             -> gate_up -> silu -> H,quant -> down_proj -> IN-NORM(next)
+      gdn  : [H,quant] -> in_proj(s) -> conv1d -> delta-rule -> gated-norm
+             -> [H,quant] -> out_proj -> post-norm -> [H,quant] -> gate_up
+             -> silu -> [H,quant] -> down_proj -> IN-NORM(next)
       full : [H,quant] -> qkv -> qk-norm/rope -> kv-write -> fmha -> out-gate
-             -> H,quant -> o_proj -> post-norm -> ...same MLP... -> IN-NORM(next)
+             -> [H,quant] -> o_proj -> post-norm -> ...same MLP... -> IN-NORM(next)
 
-    The fused `..._rms_norm_3` / `..._rms_norm_mm_view_3` kernel is the residual
-    add plus the *next* layer's input norm, so it terminates a layer and names
-    the kind of the one that follows.  There are num_layers such markers per
-    forward: num_layers-1 layer starts plus the model's final norm.
+    The fused `..._rms_norm*_3` kernel is the residual add plus the *next*
+    layer's input norm, so it terminates a layer.  It appears num_layers times
+    per forward: num_layers-1 layer starts plus the model's final norm.
+
+    The layer kind comes from the segment's *contents* (gdn:: kernels vs FMHA /
+    KV-write), not from the marker name: the MXFP4 build emits two distinct norm
+    kernels for the two layer types but the BF16 build collapses them into one.
     """
-    marks = []
-    for i, (_, _, n) in enumerate(evlist):
-        if n.startswith(M_NORM_IN_GDN):
-            marks.append((i, "gdn"))
-        elif n.startswith(M_NORM_IN_FULL):
-            marks.append((i, "full"))
+    marks = [i for i, (_, _, n) in enumerate(evlist)
+             if RE_NORM_IN.search(base_name(n))]
     if not marks:
         return [], {}
-    kinds = layer_kinds(cfg)
-    layers = [(kinds[0], 0, marks[0][0] + 1)]
+    bounds = [(0, marks[0] + 1)]
     for j in range(len(marks) - 1):
-        layers.append((marks[j][1], marks[j][0] + 1, marks[j + 1][0] + 1))
-    layers.append((marks[-1][1], marks[-1][0] + 1, len(evlist)))
-    # the final norm produced one marker too many: everything after the last
+        bounds.append((marks[j] + 1, marks[j + 1] + 1))
+    bounds.append((marks[-1] + 1, len(evlist)))
+    # the final norm produced one boundary too many: everything after the last
     # real decoder layer is the lm_head / sampling tail
     n_layers = cfg["layers"]
-    if len(layers) > n_layers:
-        tail_lo = layers[n_layers][1]
-        layers = layers[:n_layers] + [("head", tail_lo, len(evlist))]
+    tail = None
+    if len(bounds) > n_layers:
+        tail = (bounds[n_layers][0], len(evlist))
+        bounds = bounds[:n_layers]
 
-    order = {"gdn": GDN_LINEARS, "full": FULL_LINEARS, "head": ["lm_head"]}
-    tags = {}
+    expected = layer_kinds(cfg)
+    layers = []
+    for n, (lo, hi) in enumerate(bounds):
+        kind = _segment_kind(evlist, lo, hi)
+        if kind is None:                    # window started mid-layer
+            kind = expected[n] if n < len(expected) else "gdn"
+        layers.append((kind, lo, hi))
+    if tail:
+        layers.append(("head", tail[0], tail[1]))
+
+    order = {"gdn": GDN_LINEARS[weight_dtype], "full": FULL_LINEARS,
+             "head": ["lm_head"]}
+    kind_at = {}
     for kind, lo, hi in layers:
-        seq = list(order[kind])
-        k = 0
         for i in range(lo, hi):
-            name = evlist[i][2]
-            if not is_gemm(name) or not is_main_gemm(name):
-                continue
-            if k < len(seq):
-                # in_proj_ba is occasionally scheduled before in_proj_qkvz; its
-                # N=96 output makes the launch geometry unmistakable at M=1
-                if seq[k] == "in_proj_qkvz" and is_tiny_gemm(name):
-                    seq[k], seq[k + 1] = seq[k + 1], seq[k]
-                tags[i] = seq[k]
-            else:
-                tags[i] = "unattributed"
-            k += 1
+            kind_at[i] = kind
+    tags = {}
+    for i, (_, _, name) in enumerate(evlist):
+        if not is_gemm(name) or not is_main_gemm(name, weight_dtype):
+            continue
+        tags[i] = _gemm_role(evlist, i, kind_at.get(i, "gdn"), weight_dtype,
+                             order)
     return layers, tags
+
+
+def _segment_kind(evlist, lo, hi):
+    for i in range(lo, hi):
+        n = base_name(evlist[i][2])
+        if RE_GDN_DECODE.search(n) or RE_GDN_CHUNK.search(n) or RE_GDN_CAT.search(n):
+            return "gdn"
+        if RE_FMHA_PREFILL.search(n) or RE_FMHA_DECODE.search(n) \
+                or RE_KVWRITE.search(n):
+            return "full"
+    return None
+
+
+def _gemm_role(evlist, i, kind, weight_dtype, order, lookahead=48):
+    """Name a linear from the op that consumes its output.
+
+    Positional assignment inside a layer segment breaks whenever the graph
+    partitioner rotates a forward pass, which it does: the BF16 decode window
+    starts in the middle of layer 0's MLP and layer 0's attention block lands
+    after the final norm.  Looking forward to the first role-defining kernel is
+    immune to that, and gives the same answer for both checkpoints.
+    """
+    consumers = order.get(kind, [])
+    for j in range(i + 1, min(i + lookahead, len(evlist))):
+        n = base_name(evlist[j][2])
+        if RE_SILU.search(n):
+            return "gate_up"
+        if RE_NORM_IN.search(n):
+            return "down_proj"
+        if RE_NORM_POST.search(n) or RE_FULL_OUT_GATE.search(n) \
+                or RE_GDN_GATED_NORM.search(n):
+            return "gdn_out_proj" if kind == "gdn" else "o_proj"
+        if RE_GDN_DECODE.search(n) or RE_GDN_CHUNK.search(n) \
+                or RE_GDN_CAT.search(n) or RE_GDN_STATE.search(n):
+            if weight_dtype == "bf16":
+                return "in_proj"
+            return "in_proj_ba" if is_tiny_gemm(evlist[i][2]) else "in_proj_qkvz"
+        if RE_QK_NORM_ROPE.search(n) or RE_KVWRITE.search(n) \
+                or RE_FMHA_PREFILL.search(n) or RE_FMHA_DECODE.search(n):
+            return "qkv_proj"
+        if RE_SAMPLE.search(n):
+            return "lm_head"
+    return consumers[0] if consumers else "unattributed"

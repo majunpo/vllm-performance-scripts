@@ -21,7 +21,7 @@ from hybrid_common import (BF16_BYTES, CFG, MXFP4_BYTES, RE_FMHA_DECODE,
                            RE_GDN_DECODE, derive, load, nd_range,
                            split_graph_blocks, step_windows, walk_layers)
 
-PREFILL_ORDER = ["in_proj_qkvz", "qkv_proj", "gate_up", "down_proj",
+PREFILL_ORDER = ["in_proj", "in_proj_qkvz", "qkv_proj", "gate_up", "down_proj",
                  "gdn_out_proj", "o_proj", "in_proj_ba", "lm_head"]
 
 
@@ -33,8 +33,8 @@ def gemm_cost(m, k, n, quant):
     return flops, byts
 
 
-def collect(evlist, cfg):
-    layers, tags = walk_layers(evlist, cfg)
+def collect(evlist, cfg, wd="mxfp4"):
+    layers, tags = walk_layers(evlist, cfg, wd)
     durs = defaultdict(list)
     per_layer_kind = defaultdict(lambda: defaultdict(float))
     kind_of = {}
@@ -64,7 +64,7 @@ def gemm_table(title, rows, decode=False):
     print("-" * len(hdr))
 
 
-def report_gemm(durs, cfg, shapes, m, phase, layers_of):
+def report_gemm(durs, cfg, shapes, m, phase, layers_of, wd="mxfp4"):
     rows = []
     tot_t = tot_f = tot_b = 0.0
     quant_t = quant_b = 0.0
@@ -98,19 +98,23 @@ def report_gemm(durs, cfg, shapes, m, phase, layers_of):
           f"{tot_b/2**30:.3f} GiB")
     if phase == "decode":
         print(f"                  {tot_b/tot_t/1e3:.1f} GB/s  (memory bound)")
-        print(f"MXFP4 linears   : {quant_t/1e3:.3f} ms, {quant_b/2**30:.3f} GiB "
-              f"-> {quant_b/quant_t/1e3:.1f} GB/s")
+        if wd != "bf16":
+            print(f"MXFP4 linears   : {quant_t/1e3:.3f} ms, "
+                  f"{quant_b/2**30:.3f} GiB -> {quant_b/quant_t/1e3:.1f} GB/s")
     else:
         print(f"                  {tot_f/tot_t/1e6:.1f} TFLOPS  (compute bound)")
-        print(f"MXFP4 linears   : {quant_t/1e3:.3f} ms of {tot_t/1e3:.3f} ms")
+        if wd != "bf16":
+            print(f"MXFP4 linears   : {quant_t/1e3:.3f} ms of {tot_t/1e3:.3f} ms")
     return tot_t, tot_f, tot_b
 
 
-def report_hadamard(evlist, tags, cfg):
+def report_hadamard(evlist, tags, cfg, wd="mxfp4"):
     from hybrid_common import is_gemm, is_main_gemm
+    if wd == "bf16":
+        return 0.0
     groups = defaultdict(lambda: [0, 0.0])
     for i, (_, dur, name) in enumerate(evlist):
-        if is_gemm(name) and not is_main_gemm(name):
+        if is_gemm(name) and not is_main_gemm(name, wd):
             nd = nd_range(name)
             groups[nd[0] if nd else None][0] += 1
             groups[nd[0] if nd else None][1] += dur
@@ -223,6 +227,9 @@ def main():
     p.add_argument("--decode-step", type=int, default=3)
     p.add_argument("--max-kernel-s", type=float, default=10.0)
     p.add_argument("--graph-block-min", type=int, default=64)
+    p.add_argument("--weight-dtype", choices=("mxfp4", "bf16"), default="mxfp4",
+                   help="checkpoint weight dtype; drives the byte model, the "
+                        "GDN linear decomposition and the Hadamard section")
     p.add_argument("--ref-bw", type=float, default=0.0,
                    help="reference achievable HBM bandwidth in GB/s, e.g. the "
                         "best GEMM observed on the same device")
@@ -231,7 +238,8 @@ def main():
     args = p.parse_args()
 
     cfg = CFG
-    shapes = derive(cfg)
+    wd = args.weight_dtype
+    shapes = derive(cfg, wd)
     evs = load(args.trace, args.max_kernel_s, verbose=False)
     wins = step_windows(evs)
     if len(wins) < 2:
@@ -254,14 +262,16 @@ def main():
     dk = good[min(args.decode_step, len(good) - 1)]
     dec = list(evs[wins[dk][0]:wins[dk][1]])
 
-    w = "MXFP4 (e2m1, group=32, uint8 E8M0 scale) weights + MXFP4 activations"
+    w = ("MXFP4 (e2m1, group=32, uint8 E8M0 scale) weights + MXFP4 activations"
+         if wd != "bf16" else "BF16 weights and activations (unquantized)")
     print(f"model   : {cfg['name']}  hidden={cfg['hidden']} inter={cfg['inter']} "
           f"layers={cfg['layers']} vocab={cfg['vocab']}")
     print(f"          gdn: {cfg['gdn_v_heads']}v x {cfg['gdn_v_dim']} / "
           f"{cfg['gdn_k_heads']}k x {cfg['gdn_k_dim']}, conv={cfg['gdn_conv_kernel']}"
           f"   full: {cfg['heads']}q/{cfg['kv_heads']}kv x {cfg['head_dim']}"
           f"{', output-gated' if cfg['attn_output_gate'] else ''}")
-    print(f"quant   : {w}  ({MXFP4_BYTES:.5f} B/element); lm_head kept in bf16")
+    print(f"quant   : {w}  ({MXFP4_BYTES if wd != 'bf16' else BF16_BYTES:.5f} "
+          f"B/element); lm_head kept in bf16")
     print(f"workload: prompt={tokens} tokens, batch={args.batch}, "
           f"decode step #{dk} of {len(good)} complete steps")
     if alien:
@@ -269,15 +279,19 @@ def main():
               f"({sum(e[1] for e in alien)/1e3:.3f} ms) removed from the prefill "
               f"window (collapsed graph replay)")
 
-    _, ptags, pdurs, _ = collect(pre, cfg)
-    _, dtags, ddurs, _ = collect(dec, cfg)
+    _, ptags, pdurs, _ = collect(pre, cfg, wd)
+    _, dtags, ddurs, _ = collect(dec, cfg, wd)
 
-    pt, pf, pb = report_gemm(pdurs, cfg, shapes, tokens, "prefill", cfg["layers"])
-    ph = report_hadamard(pre, ptags, cfg)
-    print(f"  Hadamard + quantise overhead is {ph/pt*100:.1f} % of prefill GEMM time")
+    pt, pf, pb = report_gemm(pdurs, cfg, shapes, tokens, "prefill",
+                             cfg["layers"], wd)
+    ph = report_hadamard(pre, ptags, cfg, wd)
+    if ph:
+        print(f"  Hadamard + quantise overhead is {ph/pt*100:.1f} % of prefill "
+              f"GEMM time")
 
-    dt, df, db = report_gemm(ddurs, cfg, shapes, args.batch, "decode", cfg["layers"])
-    dh = report_hadamard(dec, dtags, cfg)
+    dt, df, db = report_gemm(ddurs, cfg, shapes, args.batch, "decode",
+                             cfg["layers"], wd)
+    dh = report_hadamard(dec, dtags, cfg, wd)
 
     report_gdn(pre, cfg, args.batch, tokens, "PREFILL")
     report_gdn(dec, cfg, args.batch, tokens, "DECODE (one step)")
