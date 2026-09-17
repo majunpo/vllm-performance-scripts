@@ -1,0 +1,1 @@
+../../.github/skills/qwen36-hybrid-perf-analysis/scripts/make_hybrid_perfetto_trace.py

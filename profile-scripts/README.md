@@ -441,6 +441,36 @@ batch was not constant (preemption?), trace may be impure
 
 torch trace 可使用 Perfetto 或 `chrome://tracing` 打开。
 
+### 7.1 Trace 分析脚本
+
+采集完之后的分析脚本按模型族分成两个目录，里面都是指向
+`.github/skills/<skill>/scripts/` 的软链接，改动只需在 skill 目录里做一次。
+每个 skill 的 `SKILL.md` 和 `references/` 里有完整的用法、计量陷阱和报告模板。
+
+| 目录 | 适用模型 | 对应 skill |
+| --- | --- | --- |
+| [`qwen3-perf-analysis/`](qwen3-perf-analysis) | Qwen3 等**稠密**模型（XPU unitrace + NV torch profiler） | `qwen3-perf-analysis`、`xpu-nv-perf-comparison` |
+| [`qwen36-hybrid-perf-analysis/`](qwen36-hybrid-perf-analysis) | Qwen3.5 / Qwen3.6 等 **GDN 线性注意力 + 全注意力混合**模型（XPU unitrace） | `qwen36-hybrid-perf-analysis` |
+
+判据很简单：**trace 里出现 `gdn::` kernel 就用 hybrid 那套**，否则用稠密那套。
+
+```bash
+# 稠密模型
+python profile-scripts/qwen3-perf-analysis/analyze_trace.py <trace>.json --num-layers 64 --batch 1
+python profile-scripts/qwen3-perf-analysis/analyze_gemm_shapes.py <trace>.json --batch 1 --prompt-len 3500
+python profile-scripts/qwen3-perf-analysis/make_perfetto_trace.py <trace>.json --num-layers 64
+
+# 混合注意力模型（GDN + full attention）
+A=profile-scripts/qwen36-hybrid-perf-analysis
+python $A/analyze_hybrid_trace.py <trace>.json                     # 分类 / 逐层 / 单步精确表
+python $A/analyze_hybrid_gemm.py  <trace>.json --batch 1 --prompt-len 3300 \
+       --ref-tflops 500 --ref-bw 1035                              # 逐 shape TFLOPS / 带宽
+python $A/make_hybrid_perfetto_trace.py <trace>.json               # reflow 后的时间线
+```
+
+依赖：`pip install ijson`。`hybrid_common.py` 是前三个脚本共用的模型拓扑与
+kernel 分类，换模型时只改它里面的 `CFG`。
+
 ## 8. NVIDIA CUDA 使用
 
 NV 目录只支持 torch profiler，不使用 unitrace。默认开启 CUDA graph，只有传入 `--enforce-eager` 才关闭。

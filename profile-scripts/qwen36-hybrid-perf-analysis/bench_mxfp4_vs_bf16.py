@@ -1,0 +1,1 @@
+../../.github/skills/qwen36-hybrid-perf-analysis/scripts/bench_mxfp4_vs_bf16.py

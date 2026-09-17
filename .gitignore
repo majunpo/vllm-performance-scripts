@@ -19,6 +19,9 @@ perf-report.md
 xpu-vs-nv-comparison*.md
 analyze_trace.txt
 analyze_trace.err
+analyze_hybrid_trace.txt
+analyze_hybrid_gemm.txt
+bench_mxfp4_vs_bf16.txt
 analysis.txt
 gemm_shapes.txt
 analyze_gemm_shapes.txt
