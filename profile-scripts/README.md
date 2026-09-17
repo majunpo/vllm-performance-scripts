@@ -21,6 +21,87 @@ XPU 使用建议：
 - 采集严格固定 batch 的纯 decode：使用 `--phase decode-only`。
 - 第一次换模型或环境时，先运行 `--check`。
 
+三个 shell launcher 的选项名称完全一致，公共参数和默认值见第 4 节。每个选项都可以用同名大写环境变量覆盖，例如 `MODEL`、`TP`、`BS`、`PHASE`、`PROFILE_STEPS`、`LOG_DIR`、`TRACE_ROOT`；命令行参数优先级更高。三者都支持 `--check`（只做环境自检）和 `-h` / `--help`。
+
+### 1.1 `xpu/run_torch_profile.sh`
+
+XPU torch profiler 入口，以 `--profiler torch` 调用 [`run_auto_model_xpu-bs-decode-only.py`](xpu/run_auto_model_xpu-bs-decode-only.py)。
+
+```bash
+[环境变量] bash profile-scripts/xpu/run_torch_profile.sh [选项]
+```
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `ZE_AFFINITY_MASK` | `0` | 暴露的 XPU，数量不能少于 `--tp` |
+| `PYTHON_BIN` | `python` / `python3` | 未激活 venv 或默认解释器不对时必须指定 |
+
+脚本启动 Python 前会自动导出 `NEOReadDebugKeys=1` 和 `EnableImplicitConvertionToCounterBasedEvents=0`。
+
+输出（`--trace-root` 和 `--log-dir` 可改）：
+
+```text
+profile-scripts/xpu/torch-profile-trace/<tag>/
+profile-scripts/xpu/torch-profile-log/torch-profile-log-<tag>.log
+```
+
+用法示例见 2.2、2.3 和 2.4 节。
+
+### 1.2 `xpu/run_unitrace.sh`
+
+XPU unitrace 入口。与 1.1 使用同一个 Python 脚本，区别是外面套了一层 unitrace。
+
+```bash
+[环境变量] bash profile-scripts/xpu/run_unitrace.sh [选项]
+```
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `ZE_AFFINITY_MASK` | `0` | 暴露的 XPU，数量不能少于 `--tp` |
+| `UNITRACE_BIN` | `PATH` 中的 `unitrace` | 找不到时脚本直接报错退出 |
+| `PYTHON_BIN` | `python` / `python3` | unitrace 用 `execvp` 启动目标程序，解释器不在 `PATH` 时必须指定 |
+
+比 1.1 多一个选项：
+
+| 选项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--profiler <torch\|xpu>` | `xpu` | 传给 Python 的 profiler 类型；unitrace 采集时保持 `xpu` |
+
+固定使用的 unitrace 参数：`--chrome-itt-logging`、`--chrome-sycl-logging`、`--chrome-call-logging`、`--chrome-kernel-logging`、`--output-dir-path`、`--start-paused`。
+
+输出：
+
+```text
+profile-scripts/xpu/unitrace-trace/<tag>/
+profile-scripts/xpu/unitrace-log/unitrace-log-<tag>.log
+```
+
+用法示例见第 3 节。
+
+### 1.3 `nv/run_torch_profile_nv.sh`
+
+NVIDIA torch profiler 入口，调用 [`run_auto_model_nv-bs-decode-only.py`](nv/run_auto_model_nv-bs-decode-only.py)，不支持 unitrace，因此没有 `--profiler`。
+
+```bash
+[环境变量] bash profile-scripts/nv/run_torch_profile_nv.sh [选项]
+```
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `CUDA_VISIBLE_DEVICES` | `0` | 暴露的 GPU，数量不能少于 `--tp` |
+| `PYTHON_BIN` | `python` / `python3` | 未激活 venv 或默认解释器不对时必须指定 |
+
+`--enforce-eager` 在这里关闭的是 CUDA graph，对应 tag 中的 `cudagraph` / `eager`。
+
+输出：
+
+```text
+profile-scripts/nv/torch-profile-trace/<tag>/
+profile-scripts/nv/torch-profile-log/torch-profile-log-<tag>.log
+```
+
+用法示例见第 8 节。
+
 ## 2. XPU 快速开始
 
 ### 2.1 环境自检
