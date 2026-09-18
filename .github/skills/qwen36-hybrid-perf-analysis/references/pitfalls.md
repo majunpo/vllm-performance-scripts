@@ -259,6 +259,32 @@ CUTLASS-SYCL 在这棵树里只用于 MoE 的 grouped GEMM。MXFP8 则另有
    （`{164800;1;1}`），耗时与 token 数无关，在 decode 里占 21.9 %；MXFP4 版没有。
    **不要把两条路径的差异一律归因于量化格式本身。**
 
+## 一个 kernel 到底在处理多少数据：从 grid 反推 numel
+
+Inductor 的 pointwise kernel（`triton_poi_*`）的 ND-range 里没有 shape，但可以反推。
+bf16 下每个 work-item 处理 2 个元素，所以 **`numel = grid[0] × local[0] × 2`**。
+先拿两个 shape 已知的 kernel 标定，再套到未知的那个：
+
+| kernel | grid | 理论 numel | grid×512 |
+|---|---:|---:|---:|
+| prefill SwiGLU | 112200 | 3300×17408 = 57,446,400 | 57,446,400 ✓ |
+| decode SwiGLU | 34 | 1×17408 = 17,408 | 17,408 ✓ |
+| **`cat_4`（未知）** | **164800** | ? | **84,377,600** |
+
+再去凑模型维度：84,377,600 ÷ 3300 tokens 不是整数（排除激活），而
+`hidden × in_proj_N` = 5120 × 16480 = 84,377,600 **完全相等** ——
+于是确认它搬的是 **`in_proj` 的权重**，不是激活。
+
+结合 checkpoint 布局（BF16 版把 GDN 输入投影分存成 `in_proj_{qkv,z,b,a}`，
+宽度 10240+6144+48+48 = 16480）可以断定：这是**加载期的权重拼接泄漏进了运行时图**，
+每次前向每个 GDN 层重做一遍。MXFP4 路径在 `process_weights_after_loading` 里
+用 `replace_parameter` 做掉了，所以没有这个 kernel。
+
+**这个反推方法是通用的**：凡是遇到"开销与 batch/token 数无关"的 kernel，
+先用 `numel = grid × local × (2 if bf16 else 1)` 反推数据量，再去和
+`权重维度` / `KV cache 维度` / `state 维度` 对表，通常一次就能定位。
+判据：**只要 numel 除以 token 数不是整数，它就不是激活**。
+
    注意两边的 Inductor kernel 名和 Linear 分解都会变，`hybrid_common.py` 的 marker 与
    `CFG` 需要各自核对：BF16 版只有 **257** 个 Dense-GEMM（把 `in_proj_ba` 融进了
    `in_proj`），且 GDN 与 full 层的 input-norm 合并成了同一个 `..._rms_norm_3`，
