@@ -73,6 +73,42 @@ In this repo all four scripts are also symlinked into
 the repo root without touching `.github/`. `hybrid_common.py` must stay next to
 the other three — they import it from their own directory.
 
+### NVIDIA
+
+```bash
+python analyze_nv_hybrid_trace.py $D/rank0.*.pt.trace.json.gz --batch 1
+```
+
+One script covers everything the two XPU scripts do. Differences to know about:
+
+- **Phases come from annotations**, not from a sampler kernel:
+  `execute_context_<n>(<ctx>)_generation_<m>(<gen>)`. `ctx > 0` is the prefill.
+- **`cat=overhead` must be excluded.** `Command Buffer Full` shows up in the
+  profiler summary as "CUDA total 397.9 ms / 34.6 %" but is a host-side CUPTI
+  marker that overlaps real kernels; counting it double-counts the run. Only
+  `kernel` / `gpu_memset` / `gpu_memcpy` are summed.
+- **There is no `--weight-dtype`.** An NVIDIA build serves each linear from a
+  different backend and the backend name encodes the precision, so the byte
+  model is derived per kernel:
+
+  | kernel | precision | B/element |
+  |---|---|---|
+  | `marlin::Marlin<...>` | NVFP4, **W4A16** | 0.5625 |
+  | `cudnn_..._matMul_pointwise` | FP8 | 1.0 |
+  | `sm89_xmma_gemm_e4m3bf16_...` | FP8 (e4m3) | 1.0 |
+  | `internal::gemvx::kernel` / `cutlass_..._bf16_...gemm` | BF16 | 2.0 |
+
+  Sanity-check the result the same way as always: the decode GB/s of every
+  shape must land in one narrow band. If a precision guess is wrong, that shape
+  either exceeds the physical bandwidth or falls far outside the band.
+- **Marlin is W4A16**, so 4-bit buys bandwidth but not FLOPs. The script's
+  per-backend TFLOPS table makes this visible directly: on the reference trace
+  the FP8 path reaches 405.7 TFLOPS and Marlin only 189.0, a 2.15x ratio that
+  matches the FP8:BF16 tensor-core ratio.
+- **Timestamps are trustworthy.** CUPTI times every kernel individually even
+  under CUDA Graph, so unlike the XPU side there is no reflow step and idle /
+  bubble analysis is valid.
+
 `--ref-tflops` / `--ref-bw` are the best numbers *measured on the same device*
 by another trace (for `Intel(R) Graphics [0x674f]`: 500 TFLOPS prefill and
 1035 GB/s decode, from the Qwen3-32B MXFP8 CUTLASS-SYCL run). They turn the
@@ -115,6 +151,12 @@ and `G = L - F` GDN layers:
 | `KVCache-Write`, `FullAttn-OutGate` | `F` |
 | `GDN-Norm/Gate` | `G` |
 | unattributed GEMM | `0` |
+
+The NVIDIA script checks the same invariants plus `GDN-Attn(recurrent) = 2G`
+(decode) and `GDN-Attn(chunk)` divisible by `G` (prefill).
+
+The NVIDIA script checks the same invariants plus `GDN-Attn(recurrent) = 2G`
+(decode) and `GDN-Attn(chunk)` divisible by `G` (prefill).
 
 Then cross-check the numbers themselves:
 

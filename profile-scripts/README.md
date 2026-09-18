@@ -460,12 +460,15 @@ python profile-scripts/qwen3-perf-analysis/analyze_trace.py <trace>.json --num-l
 python profile-scripts/qwen3-perf-analysis/analyze_gemm_shapes.py <trace>.json --batch 1 --prompt-len 3500
 python profile-scripts/qwen3-perf-analysis/make_perfetto_trace.py <trace>.json --num-layers 64
 
-# 混合注意力模型（GDN + full attention）
+# 混合注意力模型（GDN + full attention）—— Intel XPU unitrace
 A=profile-scripts/qwen36-hybrid-perf-analysis
 python $A/analyze_hybrid_trace.py <trace>.json                     # 分类 / 逐层 / 单步精确表
 python $A/analyze_hybrid_gemm.py  <trace>.json --batch 1 --prompt-len 3300 \
        --ref-tflops 500 --ref-bw 1035                              # 逐 shape TFLOPS / 带宽
 python $A/make_hybrid_perfetto_trace.py <trace>.json               # reflow 后的时间线
+
+# 混合注意力模型（GDN + full attention）—— NVIDIA torch profiler
+python $A/analyze_nv_hybrid_trace.py rank0.*.pt.trace.json.gz --batch 1
 ```
 
 依赖：`pip install ijson`。`hybrid_common.py` 是前三个脚本共用的模型拓扑与
