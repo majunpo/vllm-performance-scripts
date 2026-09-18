@@ -98,13 +98,26 @@ One script covers everything the two XPU scripts do. Differences to know about:
   | `sm89_xmma_gemm_e4m3bf16_...` | FP8 (e4m3) | 1.0 |
   | `internal::gemvx::kernel` / `cutlass_..._bf16_...gemm` | BF16 | 2.0 |
 
-  Sanity-check the result the same way as always: the decode GB/s of every
-  shape must land in one narrow band. If a precision guess is wrong, that shape
-  either exceeds the physical bandwidth or falls far outside the band.
-- **Marlin is W4A16**, so 4-bit buys bandwidth but not FLOPs. The script's
-  per-backend TFLOPS table makes this visible directly: on the reference trace
-  the FP8 path reaches 405.7 TFLOPS and Marlin only 189.0, a 2.15x ratio that
-  matches the FP8:BF16 tensor-core ratio.
+  **Confirm this against the checkpoint's `quantization_config` rather than
+  trusting the mapping blindly** — a ModelOpt export states it outright, and
+  these exports are usually `"quant_algo": "MIXED_PRECISION"` rather than one
+  format throughout. For `nvidia/Qwen3.6-27B-NVFP4`:
+
+  | config entry | meaning |
+  |---|---|
+  | `config_groups.group_0`: `input_activations` **and** `weights` = `num_bits: 8, type: float` | W8A8 FP8, static scales — GDN `in_proj_qkv`/`in_proj_z`/`out_proj`, full-attn `q/k/v/o_proj` |
+  | `config_groups.group_1`: `weights` = `num_bits: 4, group_size: 16`, **no `input_activations`** | weight-only; the per-layer list spells it `"quant_algo": "W4A16_NVFP4"` — MLP + `lm_head` |
+  | a linear absent from every group | stays BF16 (here: `in_proj_b` / `in_proj_a`) |
+  | `kv_cache_scheme`: `num_bits: 8, type: float` | FP8 KV cache, static scales |
+
+  Then sanity-check the result as always: the decode GB/s of every shape must
+  land in one narrow band. If a precision guess is wrong, that shape either
+  exceeds the physical bandwidth or falls far outside the band.
+- **`W4A16` means 4-bit buys bandwidth but not FLOPs** — the weights are
+  decompressed to FP16 inside the kernel. The script's per-backend TFLOPS table
+  makes this visible directly: on the reference trace the FP8 path reaches
+  405.7 TFLOPS and Marlin only 189.0, a 2.15x ratio that matches the FP8:BF16
+  tensor-core ratio and the config's literal `W4A16` label.
 - **Timestamps are trustworthy.** CUPTI times every kernel individually even
   under CUDA Graph, so unlike the XPU side there is no reflow step and idle /
   bubble analysis is valid.

@@ -7,14 +7,20 @@ Intel unitrace. This reads `rank0.*.pt.trace.json[.gz]` and produces the same
 category / layer-type / per-linear tables so the two platforms can be compared
 row by row.
 
-The NVIDIA build serves each linear from a different backend, and the backend
-name encodes the weight precision, so the byte model is derived from the kernel
-name instead of from a --weight-dtype flag:
+A ModelOpt NVFP4 export is usually `"quant_algo": "MIXED_PRECISION"`: each
+linear is served from a different backend, and the backend name encodes the
+weight precision, so the byte model is derived from the kernel name instead of
+from a --weight-dtype flag. Verified against nvidia/Qwen3.6-27B-NVFP4's
+quantization_config:
 
-    marlin::Marlin<...>              NVFP4, W4A16   0.5625 B/element
-    cudnn_..._matMul_pointwise       FP8            1.0
-    sm89_xmma_gemm_e4m3bf16_...      FP8 (e4m3)     1.0
-    cublas gemvx / cutlass bf16      BF16           2.0
+    marlin::Marlin<...>          W4A16_NVFP4 (group 16)  0.5625 B/element
+    cudnn_..._matMul_pointwise   FP8 W8A8, static        1.0
+    sm89_xmma_gemm_e4m3bf16_...  FP8 W8A8, static        1.0
+    cublas gemvx / cutlass bf16  not quantized           2.0
+
+W4A16 means the 4-bit weights are decompressed to FP16 before the MACs, so the
+MLP gets 4-bit bandwidth but BF16 compute. The per-backend TFLOPS table exists
+to make that visible.
 """
 
 import argparse
