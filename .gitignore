@@ -13,6 +13,13 @@ profile_logs_*/
 *.pt.trace.json.gz
 *.perfetto.json.gz
 
+# server / eval run output -- contains internal host paths and model names
+server-logs/
+lm_eval_output_*/
+lm_eval_output_*.log
+gsm8k_*.json
+gsm8k_*.log
+
 # analysis output -- internal only, keep out of the public repo.
 # Use `git add -f` if a specific report should ever be published.
 perf-report.md

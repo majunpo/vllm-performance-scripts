@@ -5,7 +5,16 @@
 
 set -euo pipefail
 
-VLLM_REPO="${VLLM_REPO:-/home/junpo/applications.ai.gpu.vllm-xpu}"
+# Falls back to the first checkout that actually contains the evaluator.
+if [[ -z "${VLLM_REPO:-}" ]]; then
+    for _candidate in /home/junpo/vllm-xpu /home/junpo/vllm /home/junpo/applications.ai.gpu.vllm-xpu; do
+        if [[ -f "${_candidate}/tests/evals/gsm8k/gsm8k_eval.py" ]]; then
+            VLLM_REPO="$_candidate"
+            break
+        fi
+    done
+    VLLM_REPO="${VLLM_REPO:-/home/junpo/vllm-xpu}"
+fi
 HOST="${HOST:-http://127.0.0.1}"
 PORT="${PORT:-9001}"
 MODEL=""
@@ -31,6 +40,8 @@ Server:
   --host                  Host URL, default http://127.0.0.1
   -p, --port              Port, default 9001
   -m, --model             Served model id; default: auto-detect from /v1/models
+  --vllm-repo             vLLM checkout holding tests/evals/gsm8k/gsm8k_eval.py;
+                          also settable via the VLLM_REPO env var
 
 Evaluation:
   --mode <chat|completion>  chat applies the chat template (default),
@@ -62,6 +73,7 @@ while [[ $# -gt 0 ]]; do
         --host) HOST="$2"; shift 2 ;;
         -p|--port) PORT="$2"; shift 2 ;;
         -m|--model) MODEL="$2"; shift 2 ;;
+        --vllm-repo) VLLM_REPO="$2"; shift 2 ;;
         --mode) MODE="$2"; shift 2 ;;
         --thinking) THINKING="$2"; shift 2 ;;
         -n|--num-questions) NUM_QUESTIONS="$2"; shift 2 ;;
@@ -92,7 +104,8 @@ if (( ! DRY_RUN )) && [[ -z "$PYTHON_BIN" ]]; then
     exit 1
 fi
 if (( ! DRY_RUN )) && [[ ! -f "$EVAL_SCRIPT" ]]; then
-    echo "Error: $EVAL_SCRIPT not found. Set VLLM_REPO to the vllm checkout."
+    echo "Error: $EVAL_SCRIPT not found."
+    echo "Set VLLM_REPO=<vllm checkout> or pass --vllm-repo <path>."
     exit 1
 fi
 
