@@ -9,9 +9,16 @@ torch-profile-log/
 torch-profile-trace/
 profile_logs_*/
 *profile_logs_*/
+
+# raw traces, matched by name so they stay ignored outside the dirs above --
+# they embed model paths, host names and the full kernel inventory
+python.*.json
+ldconfig.*.json
+rank*.pt.trace.json
 *.pt.trace.json
 *.pt.trace.json.gz
 *.perfetto.json.gz
+perfetto.log
 
 # server / eval run output -- contains internal host paths and model names
 server-logs/
@@ -24,12 +31,10 @@ gsm8k_*.log
 # Use `git add -f` if a specific report should ever be published.
 perf-report.md
 xpu-vs-nv-comparison*.md
-analyze_trace.txt
-analyze_trace.err
-analyze_hybrid_trace.txt
-analyze_hybrid_gemm.txt
+analyze_*.txt
+analyze_*.err
+kernel-detail-*.txt
 bench_mxfp4_vs_bf16.txt
 analysis.txt
 gemm_shapes.txt
-analyze_gemm_shapes.txt
 profiler_out_*.txt
