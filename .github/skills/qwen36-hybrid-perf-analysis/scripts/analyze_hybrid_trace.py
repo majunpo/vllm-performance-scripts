@@ -13,8 +13,11 @@ import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hybrid_common import (CATEGORY_ORDER, CFG, GDN_LINEARS, bucket, is_gemm,
-                           is_main_gemm, layer_kinds, load, split_graph_blocks,
+from hybrid_common import (CATEGORY_ORDER, CFG, GDN_LINEARS, bucket,
+                           detect_batch, detect_prompt_len,
+                           fused_hadamard_quant, gemm_nd_histogram, is_gemm,
+                           is_main_gemm, layer_kinds, load,
+                           prefill_window_indices, split_graph_blocks,
                            step_windows, ts_collapsed, walk_layers)
 
 
@@ -132,13 +135,16 @@ def sanity(evlist, layers, tags, phase, cfg, wd="mxfp4"):
     want_gdn = cfg["layers"] - want_full
     n_gdn_lin = len(GDN_LINEARS[wd])
     n_quant = 0 if wd == "bf16" else n_gdn_lin * want_gdn + 4 * want_full
+    # a fused fwht_quant kernel writes the E8M0 scales itself, so the separate
+    # cast kernel disappears -- still one quantise launch per quantised linear
+    n_cast = 0 if fused_hadamard_quant(evlist) else n_quant
     checks = [
         ("gdn layers", n_gdn, want_gdn),
         ("full layers", n_full, want_full),
         ("Dense-GEMM", cats["Dense-GEMM"][0],
          n_gdn_lin * want_gdn + 4 * want_full + 1),
         ("Quantize(mxfp4)", cats["Quantize(mxfp4)"][0], n_quant),
-        ("Quant-scale cast", cats["Quant-scale cast"][0], n_quant),
+        ("Quant-scale cast", cats["Quant-scale cast"][0], n_cast),
         ("Activation(SiLU)", cats["Activation(SiLU)"][0], cfg["layers"]),
         ("KVCache-Write", cats["KVCache-Write"][0], want_full),
         ("GDN-Norm/Gate", cats["GDN-Norm/Gate"][0], want_gdn),
@@ -152,8 +158,21 @@ def sanity(evlist, layers, tags, phase, cfg, wd="mxfp4"):
         ok &= got == want
         print(f"  [{flag}] {name:<22} got={got:<6} expected={want}")
     if not ok:
-        print("  !! counts are off -- the step window is clipped or the kernel "
-              "markers changed; do not trust the numbers below")
+        print("  !! counts are off -- the step window is clipped, the CFG does "
+              "not match the model, or the kernel markers changed;")
+        print("  !! do not trust the numbers below (see references/pitfalls.md)")
+    if cats["Dense-GEMM"][0] != n_gdn_lin * want_gdn + 4 * want_full + 1:
+        print("  !! Dense-GEMM is off: the gemm_kernel work-group shapes in "
+              "hybrid_common (MAIN_GEMM_LOCAL / DECODE_MAIN_LOCAL) probably do "
+              "not hold on this device/driver.")
+        print("  !! Below is every gemm_kernel ND-range in this window so they "
+              "can be re-derived: a real linear's count is a combination of "
+              f"G={want_gdn}, F={want_full}, L={cfg['layers']} and 1; "
+              "everything else is the Hadamard rotation.")
+        print(f"     {'local WG':<16} {'grid[0]==1':>10} {'cnt':>7} {'ms':>10}")
+        for local, single_wg, cnt, ms in gemm_nd_histogram(evlist):
+            print(f"     {str(local):<16} {str(single_wg):>10} {cnt:>7} "
+                  f"{ms/1e3:>10.3f}")
     return ok
 
 
@@ -195,9 +214,25 @@ def main():
 
     wins = step_windows(evs)
     if len(wins) < 2:
-        sys.exit("need at least one prefill and one decode window")
+        sys.exit("need at least one prefill and one decode window "
+                 "(out=1 trace? use analyze_prefill_only.py)")
     print(f"\nforward passes detected: {len(wins)} "
           f"(window 0 = prefill, 1..{len(wins)-1} = decode)")
+
+    pf = prefill_window_indices(evs, wins)
+    batch = detect_batch(evs, wins)
+    tokens = detect_prompt_len(evs[wins[0][0]:wins[0][1]])
+    print(f"workload: prompt={tokens} tokens, batch={batch} "
+          f"(both read off the KV-write ND-range)")
+    if len(pf) > 1:
+        print(f"\n!! {len(pf)} windows contain a full prefill FMHA: {pf}")
+        print("!! chunked prefill split the prompt across several forward "
+              "passes (prompt > max_num_batched_tokens).")
+        print("!! Window 0 is only the FIRST chunk and the other chunks are "
+              "being counted as decode steps --")
+        print("!! the prefill and decode numbers below are both wrong. "
+              "Re-capture with a larger --max-num-batched-tokens,")
+        print("!! or analyse each chunk separately with dump_kernels.py.")
 
     # ---- prefill -------------------------------------------------------
     plo, phi = wins[0]
@@ -242,10 +277,12 @@ def main():
             dtotal += dur
 
     print(f"\n{'='*118}\nOVERVIEW\n{'='*118}")
-    print(f"prefill              : {ptotal/1e3:10.3f} ms")
+    print(f"prefill              : {ptotal/1e3:10.3f} ms"
+          + (f"  ({tokens} tokens -> {tokens*1e6/ptotal:.0f} tok/s)"
+             if tokens else ""))
     print(f"decode               : {dtotal/1e3:10.3f} ms over {len(good)} steps "
           f"-> {dtotal/len(good)/1e3:.3f} ms/step "
-          f"({1e6*len(good)/dtotal:.2f} tok/s at bs=1)")
+          f"({(batch or 1)*1e6*len(good)/dtotal:.2f} tok/s at bs={batch or '?'})")
 
     print_categories(pcats, "PREFILL categories", ptotal)
     print_layer_split(pre, players, "PREFILL")

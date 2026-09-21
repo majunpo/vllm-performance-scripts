@@ -29,10 +29,15 @@
 ## 3. 分类时间统计
 ### 3.1 PREFILL 分类（<T> ms，<N> tokens）
 ### 3.2 DECODE 分类（<N> 个完整 step 的 ms/step）
-### 3.3 单个 PREFILL step 精确统计
-### 3.4 单个 DECODE step 精确统计（step #k）
-<表格：类别 | cnt | ms | % | kernel（可直接在 trace 中搜索，带 ND-range）>
-<Dense-GEMM 下先按 linear 名展开，再按 kernel 签名展开>
+### 3.3 单个 PREFILL step 精确统计（<T> ms，<N> 个 kernel）
+### 3.4 单个 DECODE step 精确统计（step #k，<T> ms，<N> 个 kernel）
+<表格：类别 | cnt | ms | % | kernel（可直接在 trace 中搜索，**完整名字 + ND-range**）>
+<Dense-GEMM 下先按 linear 名展开（用 ├/└），再按 kernel 签名展开>
+<数据源只能是 kernel-detail-*.txt（dump_kernels.py），不能用被截断的分析输出>
+### 3.5 分类说明（融合情况 / 与上一版的算子改名对照）
+<表格：kernel | 融合了哪些 op | 本报告分类>
+<若存在同模型的旧报告，再加一张“旧 kernel 名 → 新 kernel 名”对照表>
+<并给出每次前向的**恒定 kernel 计数**，供下一条 trace 直接校验>
 
 ## 4. GDN 层 vs Full-Attention 层
 ### 4.1 每层耗时对照
@@ -77,12 +82,34 @@
 <命令 + 产物清单 + 注意事项>
 ````
 
+## 纯 prefill（out=1）trace 的变体
+
+只有一次前向，没有 decode，所以 §3.2 / §3.4 / §5.2 / §6.3 去掉，并补上两节：
+
+````markdown
+### 2.1 与 out=20 trace 的交叉验证（方法学验证）
+<表格：逐类别对比 out=1 与 out>1 报告的 prefill 窗口，给出差异百分比>
+<out=1 时间戳不塔缩，可以反过来证明 out>1 报告里“剔除图重放 + sum-of-durations”的处理正确>
+
+## 7. 调度与空隙分析（这条 trace 独有）
+<wall span / busy 百分比 / idle 总量 / 间隙数与中位数>
+### 7.1 空隙归属（按“间隙之后的那个 kernel”分类）
+### 7.2 最大的 10 个间隙
+<结论必须回答：瓶颈是 kernel 本身还是 launch/调度？计算主干（GEMM/GDN/FMHA/量化）
+ 的空隙总和是多少？>
+````
+
 ## 写作要求
 
 - **类别名沿用脚本输出**，不要自创。
-- **精确单步表必须完整展开脚本输出的 kernel 子项**，保留 count、ms、%、可搜索的完整
-  kernel 名（带 ND-range）。ND-range 是这张表最大的价值：它是唯一能把 kernel 反查回
-  具体 shape 的线索。
+- **精确单步表（§3.3 / §3.4）是整份报告最有价值的部分，不允许省略或用概述表代替**。
+  它必须完整展开每个类别的 kernel 子项，保留 count、ms、%、**可搜索的完整 kernel 名
+  （带 ND-range）**。ND-range 是这张表最大的价值：它是唯一能把 kernel 反查回具体 shape
+  的线索。数据源只能是 `dump_kernels.py` 的 `kernel-detail-*.txt`，
+  `analyze_hybrid_trace.py` 的名字被截断过，不能用。
+- **看不出用途的 kernel 要加一句中文注解**（`UT-transform 求逆`、
+  `K=17408（down_proj 的输入）`、`单 work-group`），否则表只对写报告的人有用。
+- **长尾用一行「其余 N 个」收拢，不能默默丢掉**，count 和 ms 必须仍然加得回类别总数。
 - **GDN 与 full attention 必须分开报**，这是混合模型报告的核心，不能只给一个
   "Attention" 总数。
 - **每个优化建议都要带量化收益**，用实测数据推导（例如"MXFP4 linear 从 281.7 GB/s 拉到

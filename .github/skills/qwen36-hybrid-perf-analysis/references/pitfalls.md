@@ -113,6 +113,132 @@ split-KV kernel。它的 mangled name 里含 `XeFMHAFwdSplitKVKernel`，按 deco
 得到 8274 GB/s 这种荒谬值。判定 reduce / decode FMHA 时要先排除 `ReduceSplitK`，并按
 phase 分开算。
 
+## 10. prefill 里 `in_proj_qkvz` 和 `in_proj_ba` 会被 walker 并成一个桶
+
+现象（`...-260920-092747`）：`analyze_hybrid_gemm.py` 报
+`in_proj_qkvz  calls=96  med_us=2401  TFLOPS=230.6`，`in_proj_ba` 整行消失，
+aggregate 变成 `187.14 TFLOP / 137.6 TFLOPS`。
+
+判据：**96 = 48 + 48**，而且 `med_us` 恰好是两组的中点
+（48 个 ≈75 µs 和 48 个 ≈4800 µs 混排，中位数 ≈2437 µs）。真实值是
+`160.71 TFLOP / 118.2 TFLOPS`，**偏高整整一倍**。
+
+修正：用 `hybrid_common.cluster_gemm_durations()` 按时长聚类（**按 ND-range 签名分组**，
+因为一个 build 可能用不同形状的 kernel 服务不同 shape）。M=3300 时每个 linear 的耗时
+离散度 < 4 %，304 个 prefill GEMM 精确落进 6 个簇、合计误差为 0：
+
+| n | med ms | linear |
+|---:|---:|---|
+| 48 | 0.073 | `in_proj_ba` (N=96) |
+| 64 | 1.677 | `gdn_out_proj`(48) + `o_proj`(16)，同 shape 6144×5120 |
+| 16 | 3.954 | `qkv_proj` |
+| 48 | 4.762 | `in_proj_qkvz` |
+| 64 | 5.364 | `down_proj` |
+| 64 | 9.540 | `gate_up` |
+
+同 shape 的那一簇用 walker 的计数再拆。阀值是**相对的**
+（`gap > max(50 µs, 8 % × 前一个值)`），所以不绑定 prompt 长度；绝对下限是为了不把
+`in_proj_ba` 拆开（它的第一次调用是 40.7 µs 的 warm-up 离群点，其余 ≈73 µs）。
+
+**只对 prefill 窗口有意义**：M=1 时各 shape 的耗时互相重叠（decode 下 48 个 `gdn_out_proj`、
+16 个 `o_proj`、16 个 `qkv_proj`、48 个 `in_proj_qkvz` 会并成一个 128 的簇），脚本因此
+在 decode 窗口不输出这一段。**任何 prefill GEMM 表在发布前都要跑一遍聚类对账**，
+两边总和必须完全相等。
+
+## 11. 一次 fusion 改名会把整个类别搬家
+
+`...-260920-092747` 相对 `...-260917-005123` 发生了两处融合：
+
+1. Hadamard 旋转 + 量化 + E8M0 scale 写出，从 3 个 kernel
+   （`gemm_kernel[SIMD16 {128;1;1} {32;4;1}]` ×1168 +
+   `per_token_group_quant_mxfp4_vec_kernel` ×304 +
+   `CastScalarFunc<float, Float8_e8m0fnu>` ×304）融成单个
+   **`ark::XpuMxfp4Hadamard::fwht_quant_per_item`** ×304。
+2. GDN 的 gated-norm kernel 改名成
+   `triton_per_fused__to_copy_add_**inc_ark_mxfp4_hadamard_quant**_mean_mul_pow_rsqrt_silu_view_0`
+   ——它把下一个 linear 的 Hadamard/量化也融了进来，所以名字**同时**命中
+   `RE_QUANT` 和 `RE_GDN_GATED_NORM`。
+
+这两点都已经在代码里处理好了：`bucket()` 把 `RE_GDN_GATED_NORM` 排在 `RE_QUANT`
+**之前**，sanity check 用 `fused_hadamard_quant()` 判断后把 `Quant-scale cast` 的
+期望值改成 0。旧 build、新 build、BF16 三种 trace 现在都能全部 `OK`。
+
+**下次再遇到类似情况的处理顺序**：
+
+1. `grep -o '<前缀>[^"]*' trace.json | sort -u` 拿到新全名；
+2. 看“少掉的计数”是不是等于“多出来的计数”——相等就是改名，不是丢了活；
+3. 改 `bucket()` 里的正则顺序，**不要**在调用方后处理，否则各脚本和 sanity check 会不一致；
+4. 把“旧名 → 新名”写进报告的 §3.5。
+
+同一版本还有这些改名，对比算子时一起看：
+
+| 旧（260917-005123） | 新（260920-092747） |
+|---|---|
+| `triton_poi_fused_**mm_**mul_silu_slice_**view_**2` | `triton_poi_fused_mul_silu_slice_2` |
+| `triton_poi_fused_**mm_**mul_sigmoid_view_0` | `triton_poi_fused_mul_sigmoid_view_0` |
+| `..._rms_norm_3`(gdn) + `..._rms_norm_**mm_view_**3`(full) | 合并成 `..._rms_norm_3`（64 次） |
+| `QK-Norm/RoPE` = 70（含 6 个 cos/sin 准备） | 64 = 16×4（cos/sin 已被融合/外提） |
+
+## 12. decode kernel 的 work-group 尺寸读出来是 `{0; 0; 0}`
+
+图重放时 unitrace 拿不到 local size，decode 的 ND-range 只有 global grid 有效
+（`[SIMD32 {4; 48; 1} {0; 0; 0}]`）。后果：
+
+- `is_main_gemm()` 只能靠 grid 判别，不能靠 local size；
+- 报告里要引用带完整 ND-range 的 kernel 名时，**优先引用 prefill 的，或者专门跑一条
+  `out=1` trace**（见第 13 条），那里每个 kernel 的 local size 都是真的。
+
+## 13. `out=1` 的纯 prefill trace 要用另一个脚本，而且它比 `out>1` 更可信
+
+`analyze_hybrid_trace.py` 按 sampler kernel 切窗口，要求至少一个 prefill + 一个 decode，
+`out=1` 只有一次前向，会直接退出：`need at least one prefill and one decode window`。
+用 `analyze_prefill_only.py`。
+
+这类 trace 值得专门采：**没有任何图重放，时间戳塌缩比例 0.0 %**，所以
+wall span / busy 比例 / 逐间隙的 idle 归属全部有效 —— 这是 `out>1` trace 根本给不出的。
+参考数据（`...-out1-...-260920-093215`）：wall 1730.52 ms、busy 99.5 %、idle 9.27 ms，
+其中 62 % 集中在前向准备段（H2D metadata / `_zero_kv_blocks` / slot-mapping），
+计算主干（GEMM + GDN + FMHA + 量化）的空隙合计只有 0.50 ms。
+
+它同时是 `out>1` 报告的**方法学验证**：剔除误入的 911 个 decode 重放 kernel 之后，
+两条 trace 的 prefill 逐类别差异都在 ±0.25 % 以内（总计 1721.25 vs 1718.27 ms，0.17 %）。
+这条对比要写进报告。
+
+## 14. prompt 超过 `max_num_batched_tokens` 时，prefill 会被切成多次前向
+
+`step_windows()` 按 sampler kernel 切窗口，脚本假设 **window 0 = 整个 prefill**。
+开了 chunked prefill 且 `prompt > max_num_batched_tokens` 时这个假设不成立：
+prefill 被切成 N 个 chunk，每个 chunk 一次前向，window 0 只是第一个 chunk，
+其余 chunk 会被当成 decode step 统计进去 —— prefill 偏小、decode/step 偏大，
+两边同时错。
+
+判据（脚本已内置 `prefill_window_indices()`）：**一个窗口里是否有完整的
+`XeFMHAFwdKernel`**。decode 窗口只会有 split-KV 变体，所以这个判据是精确的。
+实测参考（in3300 / budget 8192，单 chunk）：
+
+| window | kernels | 有 prefill-FMHA | KV-write grid[0] |
+|---:|---:|---|---|
+| 0 | 2754 | **True** | 3300（和误入的 decode 重放的 1） |
+| 1..19 | 1164 | False | 1 |
+
+出现多个 True 时脚本会打印警告并说明结果不可用。处理方式：重新抓 trace 并把
+`--max-num-batched-tokens` 调到 ≥ prompt 长度，或者用
+`dump_kernels.py <trace> <window>` 逐 chunk 单独分析。
+
+## 15. batch 不是 1 的时候 `--batch` 默认值会静默算错
+
+`--batch` 曾经默认 1，喂一条 bs=4 的 trace 不会报任何错，只会让 tok/s 变成
+真实值的 1/4，并让 decode FMHA / GDN state 的字节模型全部偏小。
+
+现在 `detect_batch()` 从 **decode 窗口 KV-write 的 ND-range grid[0]** 自动读出
+（decode 一步正好写 `batch` 个 token），并在 `workload:` 行回显。
+**看报告前先核对这一行和目录名是否一致**，例如
+`workload: prompt=3300 tokens, batch=1 (autodetected)` 对应 `...-in3300-...-bs1-...`。
+
+同理 `detect_prompt_len()` 取的是 KV-write grid[0] 的**最大值**而不是第一个非 1 的值 ——
+prefill 窗口里通常混着一次 decode 重放，bs>1 时那次重放的 KV-write grid 也 > 1，
+取第一个会拿到 batch 而不是 prompt 长度。
+
 ---
 
 # 分类口径
@@ -127,9 +253,9 @@ phase 分开算。
 | `GDN-Attn(recurrent)` | `gdn::causal_conv1d_kernel`、`gdn::gated_delta_rule_kernel` |
 | `Dense-GEMM` / `Hadamard-Rotation` | `gemm_kernel`，按 work-group 形状二分（见第 4 条） |
 | `KVCache-Write` | `reshape_and_cache` —— **必须排在 Quantize 前面**（名字里含 `Fp8KVCacheDataType`） |
-| `Quantize(mxfp4)` | `per_token_group_quant_mxfp4`、`float_e2m1`、`fp4` |
-| `Quant-scale cast` | `Float8_e8m0`（block scale 的独立 elementwise 拷贝） |
-| `GDN-Norm/Gate` | `triton_per_fused__to_copy_add_mean_mm_mul_pow_rsqrt_silu_view_0` |
+| `GDN-Norm/Gate` | `rsqrt_silu(_t)?_view_0$` —— **必须排在 Quantize 前面**，新 build 把 `hadamard_quant` 融进了这个 kernel 名（见第 11 条） |
+| `Quantize(mxfp4)` | `per_token_group_quant_mxfp4`、`float_e2m1`、`fp4`、`ark::XpuMxfp4Hadamard::fwht_quant_per_item` |
+| `Quant-scale cast` | `Float8_e8m0`（block scale 的独立 elementwise 拷贝；新版已融合，计数为 0） |
 | `FullAttn-OutGate` | `triton_poi_fused_mm_mul_sigmoid_view_0`（`attn_output_gate`） |
 | `Activation(SiLU)` | `triton_poi_fused_mm_mul_silu_slice_view_2` |
 | `Norm(RMS)` | `..._rms_norm_3` / `..._rms_norm_mm_view_1` / `..._rms_norm_mm_view_3` |

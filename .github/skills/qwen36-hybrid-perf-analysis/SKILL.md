@@ -1,6 +1,6 @@
 ---
 name: qwen36-hybrid-perf-analysis
-description: 'Analyze vLLM inference traces of Qwen3.5/Qwen3.6 hybrid-attention models (GDN gated-delta-net linear attention interleaved with full attention) on Intel XPU, and produce a perf-report.md with a per-operator prefill/decode breakdown. Use when given a unitrace Chrome-trace JSON (python.<pid>.json) from a Qwen3.6-27B / Qwen3.5 / Qwen3-Next style run, or when asked to: break down GPU kernel time for a hybrid GDN + full-attention model, separate GDN layers from full-attention layers, compute per-shape GEMM TFLOPS and achieved bandwidth for MXFP4/MXFP8 linears, judge whether the quantized GEMM path has an XMX kernel at all or is running oneDNN weight decompression, analyze the GDN chunk prefill kernels or the recurrent decode kernels, find why decode is slow, or estimate the optimization headroom. Handles XPU-Graph collapsed timestamps, graph replays that land inside the prefill window, AutoRound online Hadamard rotations, and the in_proj_qkvz / in_proj_ba pair.'
+description: 'Analyze vLLM inference traces of Qwen3.5/Qwen3.6 hybrid-attention models (GDN gated-delta-net linear attention interleaved with full attention) on Intel XPU, and produce a perf-report.md with a per-operator prefill/decode breakdown down to individual kernel names and ND-ranges. Use when given a unitrace Chrome-trace JSON (python.<pid>.json) from a Qwen3.6-27B / Qwen3.5 / Qwen3-Next style run, or when asked to: break down GPU kernel time for a hybrid GDN + full-attention model, separate GDN layers from full-attention layers, compute per-shape GEMM TFLOPS and achieved bandwidth for MXFP4/MXFP8 linears, judge whether the quantized GEMM path has an XMX kernel at all or is running oneDNN weight decompression, analyze the GDN chunk prefill kernels or the recurrent decode kernels, find the exact hot kernel names, diff two runs operator by operator, analyze a prefill-only (out=1) trace including wall/idle/gap analysis, find why decode is slow, or estimate the optimization headroom. Handles XPU-Graph collapsed timestamps, graph replays that land inside the prefill window, AutoRound online Hadamard rotations (including the fused fwht_quant variant), and the in_proj_qkvz / in_proj_ba pair.'
 argument-hint: '<path to unitrace python.<pid>.json> [--batch N] [--prompt-len N]'
 ---
 
@@ -8,8 +8,20 @@ argument-hint: '<path to unitrace python.<pid>.json> [--batch N] [--prompt-len N
 
 Turns a unitrace device trace of a **GDN + full-attention hybrid** model into a
 `perf-report.md` with: phase-split category timings, exact single-prefill and
-single-decode kernel breakdowns, per-linear GEMM TFLOPS / achieved bandwidth,
-separate GDN and full-attention cost models, and a quantified optimization list.
+single-decode kernel breakdowns **with full kernel names and ND-ranges**,
+per-linear GEMM TFLOPS / achieved bandwidth, separate GDN and full-attention
+cost models, and a quantified optimization list.
+
+| script | purpose |
+|---|---|
+| `analyze_hybrid_trace.py` | phase split, category totals, sanity check, per-layer-type time |
+| `analyze_hybrid_gemm.py` | per-shape GEMM TFLOPS / GB/s, GDN and FMHA efficiency, roll-up |
+| **`dump_kernels.py`** | **per-kernel dump with untruncated names + GEMM attribution + duration clustering** — the source for the report's exact single-step tables |
+| **`analyze_prefill_only.py`** | **`out=1` traces: categories + real wall / busy / idle / gap attribution** |
+| **`compare_hybrid_perf.py`** | **XPU vs NV comparison report** from the two analyses above (the dense `compare_perf.py` cannot parse the hybrid format) |
+| `make_hybrid_perfetto_trace.py` | reflowed Perfetto timeline (wall-clock step time) |
+| `analyze_nv_hybrid_trace.py` | the NVIDIA counterpart of the first two |
+| `bench_mxfp4_vs_bf16.py` | standalone microbenchmark to confirm a slow-GEMM claim |
 
 This is the hybrid sibling of [qwen3-perf-analysis](../qwen3-perf-analysis/SKILL.md),
 which covers dense Qwen3 models. Use this one whenever the trace contains
@@ -23,6 +35,80 @@ which covers dense Qwen3 models. Use this one whenever the trace contains
   `full_attention`, or a `full_attention_interval`
 - Questions like "GDN 和 full attention 各占多少"、"decode 为什么只有 18 tok/s"、
   "MXFP4 有没有生效"、"prefill 的 GDN chunk 路径贵在哪"
+
+## Quick start
+
+```bash
+pip install ijson                        # the only dependency
+S=<repo>/.github/skills/qwen36-hybrid-perf-analysis/scripts
+D=<trace dir>                            # holds python.<pid>.json
+T=$(ls $D/python.*.json)
+
+python $S/analyze_hybrid_trace.py $T > $D/analyze_hybrid_trace.txt
+head -40 $D/analyze_hybrid_trace.txt     # STOP unless the sanity check is all OK
+
+python $S/analyze_hybrid_gemm.py  $T > $D/analyze_hybrid_gemm.txt
+python $S/dump_kernels.py $T prefill > $D/kernel-detail-prefill.txt
+python $S/dump_kernels.py $T <k>     > $D/kernel-detail-decode-step<k>.txt
+python $S/make_hybrid_perfetto_trace.py $T
+```
+
+`<k>` is the decode step `analyze_hybrid_trace.py` reports as
+`SINGLE DECODE STEP #k`. **Prompt length and batch size are auto-detected** from
+the KV-write ND-range and echoed as `workload: prompt=... batch=...` — check
+that line matches the directory name before reading anything else. Override
+with `--prompt-len` / `--batch` only if detection fails. For an `out=1` trace
+use `analyze_prefill_only.py` instead (see Step 1).
+
+**On a new environment, three things are not portable and must be checked
+before the numbers mean anything** — the skill tells you when each is wrong:
+
+| what | how it fails | where to fix |
+|---|---|---|
+| `CFG` (model dims) | sanity check layer counts / Dense-GEMM go `BAD` | Step 0 |
+| `gemm_kernel` work-group shapes (device + driver) | `Dense-GEMM` count `BAD`; the sanity check then prints the full ND-range histogram so they can be re-derived | Step 2 |
+| device peak / reference numbers | nothing fails — the headroom estimate is silently wrong | Step 1, `--ref-*` |
+
+Changing **input / output length or batch size needs no code change**, with one
+exception: if the prompt exceeds `max_num_batched_tokens`, chunked prefill
+splits it across several forward passes and the "window 0 = prefill" model
+breaks. Both scripts detect that (more than one window contains the full
+prefill FMHA kernel) and refuse to let the result pass silently.
+
+### Cross-platform comparison
+
+```bash
+python $S/analyze_nv_hybrid_trace.py $N/rank0.*.pt.trace.json.gz > $N/analyze_nv_hybrid_trace.txt
+
+python $S/compare_hybrid_perf.py \
+    --xpu $D/analyze_hybrid_trace.txt \
+    --nv  $N/analyze_nv_hybrid_trace.txt \
+    --xpu-name "Intel XPU (MXFP4)" --nv-name "NVIDIA RTX PRO 5000 (NVFP4)" \
+    -o xpu-vs-nv-comparison-<YYMMDD-HHMMSS>.md
+```
+
+It reads only the `.txt` outputs (no trace, no dependencies, <1 s) and writes
+§1 总体 / §2 PREFILL 对照 / §2.1 逐 shape GEMM / §3 DECODE 对照 / §3.1 逐 shape GEMM +
+**自我参照表** / §3.3 按层类型 / §4 gap 分解, plus a checklist of the parts that need
+a human (§0 对比基准、attention 与 GDN chunk 逐 kernel 对照、根因判定、优化优先级).
+`analyze_hybrid_gemm.txt` is picked up automatically from the XPU trace's
+directory; pass `--xpu-gemm` if it lives elsewhere.
+
+What it does for you beyond the tables:
+
+- **refuses to overwrite** an existing comparison — always suffix `-o` with the
+  XPU trace's timestamp so two runs can be diffed;
+- **warns when the two runs are not comparable** (prompt length or batch differ);
+- **flags the inflated `in_proj_qkvz` row** (⚠) and uses the corrected aggregate;
+- emits the **自我参照 table** — each platform's quantised-GEMM bandwidth as a
+  percentage of *its own* best shape. That ratio, not the cross-vendor one, is
+  what separates "software problem" from "hardware spec difference".
+
+> The `xpu-nv-perf-comparison` skill's `compare_perf.py` only parses the **dense**
+> `analyze_trace.py` format (`--- single PREFILL step (exact counts, ...)`) and
+> cannot read the hybrid analyses. Use `compare_hybrid_perf.py` for GDN hybrids,
+> and follow that skill's `references/comparison-template.md` when filling in the
+> human sections.
 
 ## Step 0 — Gather inputs
 
@@ -58,9 +144,38 @@ python analyze_hybrid_gemm.py  $D/python.*.json --batch 1 --prompt-len 3300 \
 
 # timeline -> drag the .json.gz into https://ui.perfetto.dev/
 python make_hybrid_perfetto_trace.py $D/python.*.json
+
+# per-kernel detail with FULL kernel names -- the data source for the report's
+# §3.3 / §3.4 exact single-step tables. NOT optional, see Step 3.
+python dump_kernels.py $D/python.*.json prefill > $D/kernel-detail-prefill.txt
+python dump_kernels.py $D/python.*.json 4       > $D/kernel-detail-decode-step4.txt
 ```
 
-For an **unquantized BF16 checkpoint** add `--weight-dtype bf16` to both analysis
+`analyze_hybrid_trace.py` truncates kernel names to ~118 characters so its
+tables stay readable. That truncation destroys exactly what the report needs:
+a name that can be pasted back into the trace, and the ND-range that ties a
+kernel to a shape. **Always also run `dump_kernels.py`** and build §3.3 / §3.4
+from its output. Pass the decode step index that `analyze_hybrid_trace.py`
+chose (it prints `DECODE step #k`) so the two agree.
+
+### Prefill-only traces (`out=1`)
+
+A run with `output=1` has a single forward pass, so `analyze_hybrid_trace.py`
+exits with `need at least one prefill and one decode window`. Use:
+
+```bash
+python analyze_prefill_only.py $D/python.*.json --prompt-len 3300 > $D/analyze_prefill_only.txt
+python dump_kernels.py        $D/python.*.json all               > $D/kernel-detail-prefill.txt
+```
+
+These traces are worth collecting deliberately: **with no graph replay the start
+timestamps are not collapsed**, so wall span, device-busy ratio and per-gap idle
+attribution are all valid — numbers an `out>1` trace cannot produce at all.
+On the reference pair they also cross-validate the `out=20` report: after the
+misplaced replay is removed the two prefill breakdowns agree to **0.17 %**.
+Always state that comparison in the report.
+
+For an **unquantized BF16 checkpoint** add `--weight-dtype bf16` to all analysis
 scripts. It switches the byte model to 2 B/element, drops the Hadamard and
 quantize sections, and uses the 4-linear GDN decomposition (a BF16 build fuses
 the GDN input projection, giving `4G + 4F + 1 = 257` Dense-GEMMs per forward
@@ -68,10 +183,11 @@ instead of `5G + 4F + 1 = 305`). Running the same workload in both precisions is
 the strongest available check on any "the quantized path is slow" claim -- see
 pitfall 5.
 
-In this repo all four scripts are also symlinked into
+In this repo every script is also symlinked into
 `profile-scripts/qwen36-hybrid-perf-analysis/`, so they can be run straight from
 the repo root without touching `.github/`. `hybrid_common.py` must stay next to
-the other three — they import it from their own directory.
+the others — they import it from their own directory. **Run the scripts from
+there; do not copy them into the trace directory.**
 
 ### NVIDIA
 
@@ -122,10 +238,23 @@ One script covers everything the two XPU scripts do. Differences to know about:
   under CUDA Graph, so unlike the XPU side there is no reflow step and idle /
   bubble analysis is valid.
 
-`--ref-tflops` / `--ref-bw` are the best numbers *measured on the same device*
-by another trace (for `Intel(R) Graphics [0x674f]`: 500 TFLOPS prefill and
-1035 GB/s decode, from the Qwen3-32B MXFP8 CUTLASS-SYCL run). They turn the
-report's headroom estimate into a measurement instead of a guess.
+`--ref-tflops` / `--ref-bw` turn the report's headroom estimate from a guess
+into a measurement, and they are **per device** — carrying the old server's
+numbers to a new one is the easiest way to publish a wrong conclusion. They
+default to 0 (section omitted). In order of preference, take them from:
+
+1. another trace of a **healthy** kernel on the same device (e.g. the Qwen3-32B
+   MXFP8 CUTLASS-SYCL run gave 500 TFLOPS prefill / 1035 GB/s decode on
+   `Intel(R) Graphics [0x674f]`);
+2. `bench_mxfp4_vs_bf16.py` on the same shapes;
+3. the trace's own `lm_head` — it is bf16 and goes through oneDNN in every XPU
+   trace, so its decode GB/s is a **lower bound** on what the device delivers,
+   and it needs no external input at all. Always report this one regardless.
+
+Vendor peak numbers (HBM GB/s, XMX TFLOPS per dtype) belong in the report's
+§1.1 hardware table, but never use them as the efficiency yardstick — quote
+"% of the best measured kernel on this device" first, "% of vendor peak"
+second.
 
 ### The timeline is not optional here
 
@@ -165,6 +294,27 @@ and `G = L - F` GDN layers:
 | `GDN-Norm/Gate` | `G` |
 | unattributed GEMM | `0` |
 
+`Quant-scale cast` is expected to be `0` on a build that fuses rotation +
+quantise + scale write into one `ark::XpuMxfp4Hadamard::fwht_quant_per_item`
+(`fused_hadamard_quant()` detects this); older builds emit `5G + 4F` separate
+`Float8_e8m0` casts. Both forms pass.
+
+**A `BAD` line is usually a renamed kernel, not a clipped window.** The markers
+are literal Inductor / backend kernel names and a newer build fuses more into
+each one, which silently moves a whole category. The taxonomy already handles
+the two known cases — `fwht_quant_per_item`, and the GDN gated-norm kernel that
+absorbed the Hadamard/quantise (`RE_GDN_GATED_NORM` is matched **before**
+`RE_QUANT` for exactly this reason). If a new one appears:
+
+1. `grep -o '<prefix>[^"]*' trace.json | sort -u` to get the new full name;
+2. check whether the count that went missing equals the count that grew — if so
+   it is a rename, not lost work;
+3. fix the regex order in `bucket()` rather than post-processing in a script,
+   so every script and the sanity check agree;
+4. record the old → new name in the report's §3.5 table.
+
+Only treat `BAD` as a data problem once the total kernel count also disagrees.
+
 The NVIDIA script checks the same invariants plus `GDN-Attn(recurrent) = 2G`
 (decode) and `GDN-Attn(chunk)` divisible by `G` (prefill).
 
@@ -188,6 +338,21 @@ Put it next to the trace, following
 [references/report-template.md](./references/report-template.md). Mandatory
 content beyond the dense-model report:
 
+- the **exact single-step tables** (`§3.3` prefill, `§3.4` decode). These are
+  the whole point of the report: they are what lets a reader find a hot kernel
+  by name and diff two runs operator by operator. Build them from
+  `kernel-detail-*.txt`, **never** from the truncated `analyze_hybrid_trace.txt`
+  tables. Requirements:
+  - one row per kernel, with `cnt | ms | % | full kernel name including the
+    ND-range`; `Dense-GEMM` expands by linear first, then by kernel signature
+  - annotate what a kernel *is* when the name does not say so
+    (`UT-transform 求逆`, `chunked causal conv1d`, `K=17408（down_proj 的输入）`)
+  - collapse the long tail into one `其余 N 个` row, never drop it silently —
+    the counts must still add up to the category total
+- a **§3.5 fusion / kernel-rename table**: which ops are fused into which
+  kernel, and — whenever an earlier report of the same model exists — a
+  side-by-side of the renamed kernels. Without it the two reports look like
+  they measured different models.
 - a **GDN layer vs full-attention layer** table (ms/layer, and the attention
   core cost with the shared MLP removed)
 - the **GDN break-even context length**: GDN's recurrent cost is O(1) while FMHA
@@ -195,6 +360,12 @@ content beyond the dense-model report:
   which the hybrid actually starts paying off.
 - the **GDN chunk-prefill table**, which is usually dominated by
   `ChunkInverseKernel`
+- for an `out=1` trace: the **wall / busy / idle** table and the **idle
+  attributed by following kernel**, plus the cross-validation against the
+  `out>1` report's prefill window
+
+Keep the generated `.txt` artifacts next to the report and list them in the
+reproduction section — the report's tables must be re-derivable from them.
 
 ## Critical Pitfalls
 
@@ -213,6 +384,13 @@ number.
 | The last `..._rms_norm_3` marker is the model's final norm, not a layer start | one phantom 65th layer that swallows `lm_head` |
 | Decode layer 0's Hadamard/quant prologue is emitted at the *end* of the window | layer 0 looks like it has no quantization |
 | Unterminated kernels at trace stop | two `gemm_kernel` events with `dur` ≈ 4.9·10^4 s dwarf the run |
+| In **prefill** the walker merges `in_proj_qkvz` + `in_proj_ba` into one 96-call bucket | that row's GFLOP and the aggregate TFLOPS **double** (137.4 instead of 118.2); fix with `cluster_gemm_durations` |
+| A fusion renames a marker kernel (`..._inc_ark_mxfp4_hadamard_quant_...`) | a whole category reads 0 and another doubles — fix the regex order in `bucket()`, not in the caller |
+| Reading ND-range work-group size from a **decode** kernel | it is `{0; 0; 0}` inside a graph replay; only the global grid is valid. Quote prefill ND-ranges, or an `out=1` trace |
+| Duration clustering applied to a **decode** window | at M=1 different shapes overlap in duration and merge into meaningless clusters; it is a prefill-only tool |
+| Prompt longer than `max_num_batched_tokens` | chunked prefill emits several prefill forward passes; window 0 is one chunk and the rest are counted as decode steps. Detected via the prefill-FMHA kernel |
+| Assuming `--batch 1` | scales tok/s and every attention byte count; now auto-detected from the decode KV-write ND-range |
+| `out=1` trace fed to `analyze_hybrid_trace.py` | exits with "need at least one prefill and one decode window"; use `analyze_prefill_only.py` |
 
 ## How GEMM Attribution Works
 
@@ -237,6 +415,20 @@ therefore structural:
    FMHA / KV-write). The MXFP4 build emits two distinct input-norm kernels for
    the two layer types (`..._rms_norm_3` / `..._rms_norm_mm_view_3`) but the
    BF16 build collapses them into one, so the marker name cannot be trusted.
+4. **Duration clustering is the independent cross-check.** At `M = prompt_len`
+   every prefill linear has a distinct and very tight duration (spread < 4 %),
+   so `cluster_gemm_durations()` recovers the per-linear totals from the
+   durations alone, per ND-range signature. Always run it (both
+   `dump_kernels.py` and `analyze_prefill_only.py` print it) and reconcile:
+   - clusters that the walker got right → the attribution is confirmed
+   - `in_proj_qkvz` / `in_proj_ba` → the walker merges them, the clusters do
+     not; **take the split from the clusters** and recompute TFLOPS
+   - `gdn_out_proj` + `o_proj` share a shape (6144x5120) so they land in one
+     cluster; split that one with the walker's counts
+   - the cluster sums must add up to the `Dense-GEMM` total with zero error;
+     if they do not, the attribution is broken and nothing below can be trusted
+   - **prefill only.** At M=1 the shapes' durations overlap and the clusters
+     are meaningless, so the scripts do not print them for a decode window.
 
 Cost models (`Hq`/`Hkv` query/kv heads, `D` head_dim, `L` KV length, `w` bytes
 per weight element = `1/2 + 1/32` for MXFP4, `2` for bf16):
@@ -249,12 +441,34 @@ GDN decode   Bytes = 2·(Vh·Dv·Dk·4)       recurrent state, read + write, fp3
 GDN conv     Bytes = 2·(conv_dim·K·2)     conv_dim = 2·Kh·Dk + Vh·Dv
 ```
 
-## Adapting to Another Hybrid Model
+## Adapting to Another Model, Device or Driver
 
 1. Update `CFG` and `MXFP4_BYTES` in `hybrid_common.py`.
-2. Re-check the Inductor marker names (`M_NORM_IN_GDN`, `M_NORM_IN_FULL`, ...):
+2. Re-check the Inductor marker names (`RE_NORM_IN`, `RE_GDN_GATED_NORM`, ...):
    torch.compile renumbers fused kernels when the graph changes. The reliable
-   way to re-derive them is to dump one decode window's kernel sequence and
-   find the two `..._rms_norm_*` variants whose counts are `G` and `F`.
-3. Re-run Step 2. If a count is off by exactly the layer count, a marker moved.
-4. MoE hybrids additionally need routing / grouped-GEMM buckets in `bucket()`.
+   way to re-derive them is to dump one decode window's kernel sequence
+   (`dump_kernels.py <trace> <k>`) and find the kernels whose per-forward counts
+   are `G`, `F` or `L`.
+3. **Re-derive the GEMM work-group shapes.** `MAIN_GEMM_LOCAL` /
+   `DECODE_MAIN_LOCAL` separate a real linear from an AutoRound Hadamard
+   rotation, and they are a property of the *device and driver*, not of the
+   model. When they are stale the `Dense-GEMM` check fails and the sanity
+   check prints the ND-range histogram for you:
+
+   ```
+   [BAD] Dense-GEMM             got=0      expected=305
+   !! Dense-GEMM is off: the gemm_kernel work-group shapes ... do not hold
+        local WG         grid[0]==1     cnt         ms
+        (128, 4, 1)           False     304   1356.826
+        (32, 2, 8)            False       1      2.939
+   ```
+
+   Read it as: the shapes whose counts are combinations of `G`, `F`, `L` and 1
+   (here 304 = 5G+4F and 1 = `lm_head`) are the linears → put them in
+   `MAIN_GEMM_LOCAL`; a shape launched thousands of times is the rotation.
+   A decode-only shape that also appears with `grid[0]==1` (the tiny
+   `in_proj_ba`) goes in `DECODE_MAIN_LOCAL`.
+4. Re-run Step 2. Every line must be `OK` before any number is quoted.
+5. Re-measure `--ref-tflops` / `--ref-bw` on the new device; never carry them
+   over.
+6. MoE hybrids additionally need routing / grouped-GEMM buckets in `bucket()`.

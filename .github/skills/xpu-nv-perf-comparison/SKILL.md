@@ -1,6 +1,6 @@
 ---
 name: xpu-nv-perf-comparison
-description: 'Compare LLM inference performance between Intel XPU and NVIDIA GPU and produce a xpu-vs-nv-comparison.md. Use when two perf-report.md / trace analyses already exist and the user asks to: compare XPU vs NV, cross-platform performance comparison, 对比分析两个平台, find where the performance gap is, decompose the prefill/decode gap by kernel category, build a side-by-side category table with kernel names, compare GEMM TFLOPS and memory bandwidth across platforms, or decide what to optimize first on the slower platform. Depends on the per-platform analyses produced by the qwen3-perf-analysis skill.'
+description: 'Compare LLM inference performance between Intel XPU and NVIDIA GPU and produce a xpu-vs-nv-comparison.md. Use when two perf-report.md / trace analyses already exist and the user asks to: compare XPU vs NV, cross-platform performance comparison, 对比分析两个平台, find where the performance gap is, decompose the prefill/decode gap by kernel category, build a side-by-side category table with kernel names, compare GEMM TFLOPS and memory bandwidth across platforms, or decide what to optimize first on the slower platform. Depends on the per-platform analyses produced by the qwen3-perf-analysis skill (dense models) or the qwen36-hybrid-perf-analysis skill (GDN hybrids, which has its own compare_hybrid_perf.py).'
 argument-hint: '<xpu analyze_trace.txt> <nv analysis.txt> [--prompt-len N] [--batch N]'
 ---
 
@@ -18,6 +18,21 @@ optimization list for the slower platform.
 
 **Prerequisite**: run the [qwen3-perf-analysis](../qwen3-perf-analysis/SKILL.md)
 skill on each platform first. This skill consumes its output.
+
+> **GDN hybrid models (Qwen3.5 / 3.6 / Qwen3-Next) use a different script.**
+> `compare_perf.py` below only parses the **dense** `analyze_trace.py` format
+> (`--- single PREFILL step (exact counts, ...)`). If the traces contain `gdn::`
+> kernels, generate the scaffold with
+> [qwen36-hybrid-perf-analysis/scripts/compare_hybrid_perf.py](../qwen36-hybrid-perf-analysis/scripts/compare_hybrid_perf.py)
+> instead, then keep using Step 2 / Step 4 and the templates in this skill:
+>
+> ```bash
+> python ../qwen36-hybrid-perf-analysis/scripts/compare_hybrid_perf.py \
+>     --xpu <xpu dir>/analyze_hybrid_trace.txt \
+>     --nv  <nv dir>/analyze_nv_hybrid_trace.txt \
+>     --xpu-name "Intel XPU" --nv-name "NVIDIA RTX PRO 5000" \
+>     -o xpu-vs-nv-comparison-<YYMMDD-HHMMSS>.md
+> ```
 
 ## Step 1 — Produce the two inputs
 

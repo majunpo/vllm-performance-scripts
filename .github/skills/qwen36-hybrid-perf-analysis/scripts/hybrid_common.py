@@ -226,12 +226,14 @@ def bucket(full, weight_dtype="mxfp4"):
         return "Dense-GEMM" if is_main_gemm(full, weight_dtype) else "Hadamard-Rotation"
     if RE_KVWRITE.search(name):
         return "KVCache-Write"
+    # before RE_QUANT: newer builds fuse the next linear's Hadamard+quantise
+    # into the GDN gated-norm kernel, so its name matches both
+    if RE_GDN_GATED_NORM.search(name):
+        return "GDN-Norm/Gate"
     if RE_QUANT.search(name):
         return "Quantize(mxfp4)"
     if RE_SCALE.search(name):
         return "Quant-scale cast"
-    if RE_GDN_GATED_NORM.search(name):
-        return "GDN-Norm/Gate"
     if RE_FULL_OUT_GATE.search(name):
         return "FullAttn-OutGate"
     if RE_SILU.search(name):
@@ -325,6 +327,123 @@ def ts_collapsed(evlist):
     cnt = Counter(ts for ts, _, _ in evlist)
     shared = sum(c for c in cnt.values() if c > 1)
     return shared / max(1, len(evlist)), (cnt.most_common(1)[0][1] if cnt else 0)
+
+
+def fused_hadamard_quant(evlist):
+    """True when the build fuses rotation + quantise + scale write into one kernel.
+
+    Older builds emit three kernels per quantised linear (a `gemm_kernel`
+    rotation, `per_token_group_quant_mxfp4_vec_kernel`, and an `Float8_e8m0`
+    cast); newer ones emit a single `ark::XpuMxfp4Hadamard::fwht_quant_per_item`.
+    Counts that expect the split form have to be relaxed when this is true.
+    """
+    return any("fwht_quant" in n for _, _, n in evlist)
+
+
+def detect_prompt_len(evlist):
+    """Prompt tokens in this window, from the KV-write ND-range (grid[0] == T).
+
+    Never guess this: it scales every prefill FLOP, so a wrong value silently
+    scales every TFLOPS number with it.  Takes the maximum rather than the
+    first match because a prefill window usually also contains a misplaced
+    decode replay, whose KV-write writes only `batch` tokens.
+    """
+    seen = [nd_range(n)[0][0] for _, _, n in evlist
+            if RE_KVWRITE.search(n) and nd_range(n)]
+    return max(seen) if seen else None
+
+
+def detect_batch(evs, wins):
+    """Sequences in a decode step, from the modal decode KV-write ND-range.
+
+    Equals `--batch`; getting it wrong silently scales tok/s and every
+    attention byte count.  Returns None if there is no decode window.
+    """
+    counts = Counter()
+    for lo, hi in wins[1:]:
+        for _, _, n in evs[lo:hi]:
+            if RE_KVWRITE.search(n):
+                nd = nd_range(n)
+                if nd:
+                    counts[nd[0][0]] += 1
+    return counts.most_common(1)[0][0] if counts else None
+
+
+def prefill_window_indices(evs, wins):
+    """Windows that ran a prefill, identified by the full prefill FMHA kernel.
+
+    A decode window only ever contains the split-KV variant, so this is exact.
+    More than one means **chunked prefill split the prompt across several
+    forward passes** (prompt > max_num_batched_tokens): window 0 is then only
+    the first chunk and the rest are miscounted as decode steps.
+    """
+    return [i for i, (lo, hi) in enumerate(wins)
+            if any(RE_FMHA_PREFILL.search(n) for _, _, n in evs[lo:hi])]
+
+
+def gemm_nd_histogram(evlist):
+    """(local, grid[0]==1, count, ms) for every `gemm_kernel` ND-range.
+
+    Diagnostic for a new device or driver, where the work-group shapes in
+    MAIN_GEMM_LOCAL / DECODE_MAIN_LOCAL no longer hold and the Dense-GEMM count
+    goes wrong.  The real linears are the shapes whose per-forward counts are
+    combinations of the layer counts (G, F, G+F, L, 1); everything else is the
+    Hadamard rotation.
+    """
+    hist = {}
+    for _, d, name in evlist:
+        if not is_gemm(name):
+            continue
+        nd = nd_range(name)
+        key = (nd[1] if nd else None, bool(nd and nd[0][0] == 1))
+        e = hist.setdefault(key, [0, 0.0])
+        e[0] += 1
+        e[1] += d
+    return sorted(((k[0], k[1], v[0], v[1]) for k, v in hist.items()),
+                  key=lambda r: -r[3])
+
+
+def cluster_gemm_durations(evlist, weight_dtype="mxfp4", rel_gap=0.08,
+                           min_gap_us=50.0):
+    """Group prefill main-GEMM launches into one cluster per problem shape.
+
+    Independent cross-check on walk_layers: at M = prompt_len every linear has
+    a distinct and very tight duration (spread < 4 %), so a gap split recovers
+    the per-linear totals from the durations alone.  This is what separates
+    `in_proj_qkvz` from `in_proj_ba`, which the walker merges into one bucket
+    in prefill -- left uncorrected that row's GFLOP and TFLOPS double.
+
+    Clusters are computed per ND-range signature because a build can serve
+    different shapes from differently-shaped kernels (the BF16 checkpoint uses
+    `{64; 8; 1}` for most linears and `{128; 4; 1}` for the 6144x5120 pair).
+
+    The split threshold is relative so it does not depend on the prompt length,
+    with an absolute floor so the cheapest linear (`in_proj_ba`, N=96, whose
+    first call is a warm-up outlier) is not split in two.
+
+    Returns [(nd_signature, [sorted duration list, ...]), ...], largest total
+    time first.  Two linears that share a shape (`gdn_out_proj` and `o_proj`,
+    both 6144x5120) land in one cluster; split them with the walker's counts.
+    """
+    by_nd = {}
+    for _, d, name in evlist:
+        if is_gemm(name) and is_main_gemm(name, weight_dtype):
+            by_nd.setdefault(name, []).append(d)
+    out = []
+    for nd, ds in by_nd.items():
+        if len(ds) < 2:
+            continue
+        ds.sort()
+        groups = [[ds[0]]]
+        for x in ds[1:]:
+            prev = groups[-1][-1]
+            if x - prev > max(min_gap_us, rel_gap * prev):
+                groups.append([x])
+            else:
+                groups[-1].append(x)
+        out.append((nd, groups))
+    out.sort(key=lambda kv: -sum(sum(g) for g in kv[1]))
+    return out
 
 
 # --------------------------------------------------------------------------

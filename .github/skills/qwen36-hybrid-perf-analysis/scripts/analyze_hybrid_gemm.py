@@ -18,8 +18,10 @@ from collections import defaultdict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hybrid_common import (BF16_BYTES, CFG, MXFP4_BYTES, RE_FMHA_DECODE,
                            RE_FMHA_PREFILL, RE_FMHA_REDUCE, RE_GDN_CHUNK,
-                           RE_GDN_DECODE, derive, load, nd_range,
-                           split_graph_blocks, step_windows, walk_layers)
+                           RE_GDN_DECODE, derive, detect_batch,
+                           detect_prompt_len, load, nd_range,
+                           prefill_window_indices, split_graph_blocks,
+                           step_windows, walk_layers)
 
 PREFILL_ORDER = ["in_proj", "in_proj_qkvz", "qkv_proj", "gate_up", "down_proj",
                  "gdn_out_proj", "o_proj", "in_proj_ba", "lm_head"]
@@ -105,6 +107,20 @@ def report_gemm(durs, cfg, shapes, m, phase, layers_of, wd="mxfp4"):
         print(f"                  {tot_f/tot_t/1e6:.1f} TFLOPS  (compute bound)")
         if wd != "bf16":
             print(f"MXFP4 linears   : {quant_t/1e3:.3f} ms of {tot_t/1e3:.3f} ms")
+        n_gdn = cfg["layers"] - cfg["layers"] // cfg["full_attention_interval"]
+        if (wd != "bf16" and not durs.get("in_proj_ba")
+                and len(durs.get("in_proj_qkvz", [])) == 2 * n_gdn):
+            fq, bq = gemm_cost(m, *shapes["in_proj_qkvz"])
+            fb, bb = gemm_cost(m, *shapes["in_proj_ba"])
+            cf = tot_f - n_gdn * fq + n_gdn * fb
+            cb = tot_b - n_gdn * bq + n_gdn * bb
+            print(f"!! the walker merged in_proj_qkvz + in_proj_ba into one "
+                  f"{2*n_gdn}-call bucket, so the in_proj_qkvz row and the "
+                  f"aggregate above are inflated.")
+            print(f"!! corrected    : {cf/1e12:.2f} TFLOP, {cb/2**30:.3f} GiB, "
+                  f"{cf/tot_t/1e6:.1f} TFLOPS  <-- quote this one")
+            print(f"!! per-linear split: run dump_kernels.py and read the "
+                  f"duration-clustering section.")
     return tot_t, tot_f, tot_b
 
 
@@ -220,7 +236,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("trace")
-    p.add_argument("--batch", type=int, default=1)
+    p.add_argument("--batch", type=int, default=0,
+                   help="sequences per decode step; autodetected from the "
+                        "decode KV-write ND-range when omitted")
     p.add_argument("--prompt-len", type=int, default=0,
                    help="prompt tokens; autodetected from the prefill KV-write "
                         "ND-range when omitted")
@@ -246,14 +264,20 @@ def main():
         sys.exit("need a prefill and at least one decode window")
 
     pre, alien = split_graph_blocks(evs, *wins[0], args.graph_block_min)
-    tokens = args.prompt_len
+    tokens = args.prompt_len or detect_prompt_len(pre)
     if not tokens:
-        for _, _, n in pre:
-            if "reshape_and_cache" in n:
-                nd = nd_range(n)
-                if nd:
-                    tokens = nd[0][0]
-                    break
+        sys.exit("could not detect the prompt length from the prefill KV-write "
+                 "ND-range -- pass --prompt-len; it scales every prefill FLOP")
+    batch = args.batch or detect_batch(evs, wins)
+    if not batch:
+        sys.exit("could not detect the batch size from the decode KV-write "
+                 "ND-range -- pass --batch; it scales tok/s and attention bytes")
+    pf = prefill_window_indices(evs, wins)
+    if len(pf) > 1:
+        print(f"!! {len(pf)} windows contain a full prefill FMHA {pf}: chunked "
+              f"prefill split the prompt across several forward passes.")
+        print("!! Window 0 is only the first chunk and the rest are counted as "
+              "decode steps -- every number below is wrong.")
     sizes = {}
     for k, (lo, hi) in enumerate(wins[1:], start=1):
         sizes.setdefault(hi - lo, []).append(k)
@@ -272,7 +296,8 @@ def main():
           f"{', output-gated' if cfg['attn_output_gate'] else ''}")
     print(f"quant   : {w}  ({MXFP4_BYTES if wd != 'bf16' else BF16_BYTES:.5f} "
           f"B/element); lm_head kept in bf16")
-    print(f"workload: prompt={tokens} tokens, batch={args.batch}, "
+    print(f"workload: prompt={tokens} tokens, batch={batch}"
+          f"{'' if args.batch else ' (autodetected)'}, "
           f"decode step #{dk} of {len(good)} complete steps")
     if alien:
         print(f"note    : {len(alien)} kernels "
@@ -289,14 +314,14 @@ def main():
         print(f"  Hadamard + quantise overhead is {ph/pt*100:.1f} % of prefill "
               f"GEMM time")
 
-    dt, df, db = report_gemm(ddurs, cfg, shapes, args.batch, "decode",
+    dt, df, db = report_gemm(ddurs, cfg, shapes, batch, "decode",
                              cfg["layers"], wd)
     dh = report_hadamard(dec, dtags, cfg, wd)
 
-    report_gdn(pre, cfg, args.batch, tokens, "PREFILL")
-    report_gdn(dec, cfg, args.batch, tokens, "DECODE (one step)")
-    report_attention(pre, cfg, args.batch, tokens, tokens, "PREFILL")
-    report_attention(dec, cfg, args.batch, tokens, tokens + 1 + dk,
+    report_gdn(pre, cfg, batch, tokens, "PREFILL")
+    report_gdn(dec, cfg, batch, tokens, "DECODE (one step)")
+    report_attention(pre, cfg, batch, tokens, tokens, "PREFILL")
+    report_attention(dec, cfg, batch, tokens, tokens + 1 + dk,
                      f"DECODE step #{dk}")
 
     ptot = sum(e[1] for e in pre)
@@ -305,7 +330,7 @@ def main():
     print(f"prefill total       : {ptot/1e3:.3f} ms  "
           f"({tokens/ptot*1e6:.0f} tok/s), GEMM = {pt/ptot*100:.1f} %")
     print(f"decode step total   : {dtot/1e3:.3f} ms  "
-          f"({args.batch*1e6/dtot:.2f} tok/s), GEMM = {dt/dtot*100:.1f} %")
+          f"({batch*1e6/dtot:.2f} tok/s), GEMM = {dt/dtot*100:.1f} %")
     if args.ref_tflops:
         ideal = pf / (args.ref_tflops * 1e12) * 1e6
         print(f"prefill GEMM at {args.ref_tflops:g} TFLOPS would take "
@@ -316,7 +341,7 @@ def main():
         print(f"decode GEMM at {args.ref_bw:g} GB/s would take "
               f"{ideal/1e3:.2f} ms (now {dt/1e3:.2f} ms, "
               f"{dt/ideal:.2f}x slower) -> step {(dtot-dt+ideal)/1e3:.2f} ms "
-              f"= {args.batch*1e6/(dtot-dt+ideal):.1f} tok/s")
+              f"= {batch*1e6/(dtot-dt+ideal):.1f} tok/s")
 
 
 if __name__ == "__main__":
