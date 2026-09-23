@@ -16,20 +16,20 @@ import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hybrid_common import (BF16_BYTES, CFG, MXFP4_BYTES, RE_FMHA_DECODE,
+from hybrid_common import (BF16_BYTES, CFG, RE_FMHA_DECODE,
                            RE_FMHA_PREFILL, RE_FMHA_REDUCE, RE_GDN_CHUNK,
                            RE_GDN_DECODE, derive, detect_batch,
                            detect_prompt_len, load, nd_range,
                            prefill_window_indices, split_graph_blocks,
-                           step_windows, walk_layers)
+                           step_windows, walk_layers, weight_bytes)
 
 PREFILL_ORDER = ["in_proj", "in_proj_qkvz", "qkv_proj", "gate_up", "down_proj",
                  "gdn_out_proj", "o_proj", "in_proj_ba", "lm_head"]
 
 
-def gemm_cost(m, k, n, quant):
-    w = MXFP4_BYTES if quant else BF16_BYTES
-    a = MXFP4_BYTES if quant else BF16_BYTES
+def gemm_cost(m, k, n, quant, wd="mxfp4"):
+    w = weight_bytes(wd) if quant else BF16_BYTES
+    a = weight_bytes(wd) if quant else BF16_BYTES
     flops = 2.0 * m * n * k
     byts = k * n * w + m * k * a + m * n * BF16_BYTES
     return flops, byts
@@ -75,7 +75,7 @@ def report_gemm(durs, cfg, shapes, m, phase, layers_of, wd="mxfp4"):
             continue
         k, n, quant = shapes[tag]
         mm = 1 if tag == "lm_head" else m
-        flops, byts = gemm_cost(mm, k, n, quant)
+        flops, byts = gemm_cost(mm, k, n, quant, wd)
         d = sorted(durs[tag])
         med = statistics.median(d)
         cnt = len(d)
@@ -101,17 +101,18 @@ def report_gemm(durs, cfg, shapes, m, phase, layers_of, wd="mxfp4"):
     if phase == "decode":
         print(f"                  {tot_b/tot_t/1e3:.1f} GB/s  (memory bound)")
         if wd != "bf16":
-            print(f"MXFP4 linears   : {quant_t/1e3:.3f} ms, "
+            print(f"{wd.upper()} linears   : {quant_t/1e3:.3f} ms, "
                   f"{quant_b/2**30:.3f} GiB -> {quant_b/quant_t/1e3:.1f} GB/s")
     else:
         print(f"                  {tot_f/tot_t/1e6:.1f} TFLOPS  (compute bound)")
         if wd != "bf16":
-            print(f"MXFP4 linears   : {quant_t/1e3:.3f} ms of {tot_t/1e3:.3f} ms")
+            print(f"{wd.upper()} linears   : {quant_t/1e3:.3f} ms of "
+                  f"{tot_t/1e3:.3f} ms")
         n_gdn = cfg["layers"] - cfg["layers"] // cfg["full_attention_interval"]
         if (wd != "bf16" and not durs.get("in_proj_ba")
                 and len(durs.get("in_proj_qkvz", [])) == 2 * n_gdn):
-            fq, bq = gemm_cost(m, *shapes["in_proj_qkvz"])
-            fb, bb = gemm_cost(m, *shapes["in_proj_ba"])
+            fq, bq = gemm_cost(m, *shapes["in_proj_qkvz"], wd)
+            fb, bb = gemm_cost(m, *shapes["in_proj_ba"], wd)
             cf = tot_f - n_gdn * fq + n_gdn * fb
             cb = tot_b - n_gdn * bq + n_gdn * bb
             print(f"!! the walker merged in_proj_qkvz + in_proj_ba into one "
@@ -243,9 +244,13 @@ def main():
                    help="prompt tokens; autodetected from the prefill KV-write "
                         "ND-range when omitted")
     p.add_argument("--decode-step", type=int, default=3)
+    p.add_argument("--decode-only", action="store_true",
+                   help="the profiler window holds pure decode steps and no "
+                        "prefill; --prompt-len then gives the KV context")
     p.add_argument("--max-kernel-s", type=float, default=10.0)
     p.add_argument("--graph-block-min", type=int, default=64)
-    p.add_argument("--weight-dtype", choices=("mxfp4", "bf16"), default="mxfp4",
+    p.add_argument("--weight-dtype", choices=("mxfp4", "mxfp8", "bf16"),
+                   default="mxfp4",
                    help="checkpoint weight dtype; drives the byte model, the "
                         "GDN linear decomposition and the Hadamard section")
     p.add_argument("--ref-bw", type=float, default=0.0,
@@ -260,26 +265,38 @@ def main():
     shapes = derive(cfg, wd)
     evs = load(args.trace, args.max_kernel_s, verbose=False)
     wins = step_windows(evs)
-    if len(wins) < 2:
+    d0 = 0 if args.decode_only else 1
+    if len(wins) < 1 + d0:
         sys.exit("need a prefill and at least one decode window")
 
-    pre, alien = split_graph_blocks(evs, *wins[0], args.graph_block_min)
-    tokens = args.prompt_len or detect_prompt_len(pre)
-    if not tokens:
-        sys.exit("could not detect the prompt length from the prefill KV-write "
-                 "ND-range -- pass --prompt-len; it scales every prefill FLOP")
-    batch = args.batch or detect_batch(evs, wins)
+    pf = prefill_window_indices(evs, wins)
+    if args.decode_only:
+        if pf:
+            sys.exit(f"windows {pf} contain a full prefill FMHA kernel -- this "
+                     f"is not a decode-only trace, drop --decode-only")
+        pre, alien = None, []
+        tokens = args.prompt_len
+        if not tokens:
+            sys.exit("--decode-only needs --prompt-len: a decode-only trace has "
+                     "no prefill KV-write to read the context length from")
+    else:
+        pre, alien = split_graph_blocks(evs, *wins[0], args.graph_block_min)
+        tokens = args.prompt_len or detect_prompt_len(pre)
+        if not tokens:
+            sys.exit("could not detect the prompt length from the prefill "
+                     "KV-write ND-range -- pass --prompt-len; it scales every "
+                     "prefill FLOP")
+    batch = args.batch or detect_batch(evs, wins, first=d0)
     if not batch:
         sys.exit("could not detect the batch size from the decode KV-write "
                  "ND-range -- pass --batch; it scales tok/s and attention bytes")
-    pf = prefill_window_indices(evs, wins)
     if len(pf) > 1:
         print(f"!! {len(pf)} windows contain a full prefill FMHA {pf}: chunked "
               f"prefill split the prompt across several forward passes.")
         print("!! Window 0 is only the first chunk and the rest are counted as "
               "decode steps -- every number below is wrong.")
     sizes = {}
-    for k, (lo, hi) in enumerate(wins[1:], start=1):
+    for k, (lo, hi) in enumerate(wins[d0:], start=d0):
         sizes.setdefault(hi - lo, []).append(k)
     modal = max(sizes, key=lambda s: len(sizes[s]))
     good = sizes[modal]
@@ -287,16 +304,21 @@ def main():
     dec = list(evs[wins[dk][0]:wins[dk][1]])
 
     w = ("MXFP4 (e2m1, group=32, uint8 E8M0 scale) weights + MXFP4 activations"
-         if wd != "bf16" else "BF16 weights and activations (unquantized)")
+         if wd == "mxfp4" else
+         "MXFP8 (e4m3, group=32, uint8 E8M0 scale) weights + MXFP8 activations"
+         if wd == "mxfp8" else
+         "BF16 weights and activations (unquantized)")
     print(f"model   : {cfg['name']}  hidden={cfg['hidden']} inter={cfg['inter']} "
           f"layers={cfg['layers']} vocab={cfg['vocab']}")
     print(f"          gdn: {cfg['gdn_v_heads']}v x {cfg['gdn_v_dim']} / "
           f"{cfg['gdn_k_heads']}k x {cfg['gdn_k_dim']}, conv={cfg['gdn_conv_kernel']}"
           f"   full: {cfg['heads']}q/{cfg['kv_heads']}kv x {cfg['head_dim']}"
           f"{', output-gated' if cfg['attn_output_gate'] else ''}")
-    print(f"quant   : {w}  ({MXFP4_BYTES if wd != 'bf16' else BF16_BYTES:.5f} "
+    print(f"quant   : {w}  ({weight_bytes(wd):.5f} "
           f"B/element); lm_head kept in bf16")
-    print(f"workload: prompt={tokens} tokens, batch={batch}"
+    print(f"workload: prompt={tokens} tokens"
+          f"{' (from --prompt-len, decode-only trace)' if args.decode_only else ''}"
+          f", batch={batch}"
           f"{'' if args.batch else ' (autodetected)'}, "
           f"decode step #{dk} of {len(good)} complete steps")
     if alien:
@@ -304,35 +326,39 @@ def main():
               f"({sum(e[1] for e in alien)/1e3:.3f} ms) removed from the prefill "
               f"window (collapsed graph replay)")
 
-    _, ptags, pdurs, _ = collect(pre, cfg, wd)
     _, dtags, ddurs, _ = collect(dec, cfg, wd)
-
-    pt, pf, pb = report_gemm(pdurs, cfg, shapes, tokens, "prefill",
-                             cfg["layers"], wd)
-    ph = report_hadamard(pre, ptags, cfg, wd)
-    if ph:
-        print(f"  Hadamard + quantise overhead is {ph/pt*100:.1f} % of prefill "
-              f"GEMM time")
+    pt = ptot = None
+    if pre is not None:
+        _, ptags, pdurs, _ = collect(pre, cfg, wd)
+        pt, pflop, _ = report_gemm(pdurs, cfg, shapes, tokens, "prefill",
+                                   cfg["layers"], wd)
+        ph = report_hadamard(pre, ptags, cfg, wd)
+        if ph:
+            print(f"  Hadamard + quantise overhead is {ph/pt*100:.1f} % of "
+                  f"prefill GEMM time")
 
     dt, df, db = report_gemm(ddurs, cfg, shapes, batch, "decode",
                              cfg["layers"], wd)
     dh = report_hadamard(dec, dtags, cfg, wd)
 
-    report_gdn(pre, cfg, batch, tokens, "PREFILL")
+    if pre is not None:
+        report_gdn(pre, cfg, batch, tokens, "PREFILL")
     report_gdn(dec, cfg, batch, tokens, "DECODE (one step)")
-    report_attention(pre, cfg, batch, tokens, tokens, "PREFILL")
+    if pre is not None:
+        report_attention(pre, cfg, batch, tokens, tokens, "PREFILL")
     report_attention(dec, cfg, batch, tokens, tokens + 1 + dk,
                      f"DECODE step #{dk}")
 
-    ptot = sum(e[1] for e in pre)
     dtot = sum(e[1] for e in dec)
     print(f"\n--- roll-up ---")
-    print(f"prefill total       : {ptot/1e3:.3f} ms  "
-          f"({tokens/ptot*1e6:.0f} tok/s), GEMM = {pt/ptot*100:.1f} %")
+    if pre is not None:
+        ptot = sum(e[1] for e in pre)
+        print(f"prefill total       : {ptot/1e3:.3f} ms  "
+              f"({tokens/ptot*1e6:.0f} tok/s), GEMM = {pt/ptot*100:.1f} %")
     print(f"decode step total   : {dtot/1e3:.3f} ms  "
           f"({batch*1e6/dtot:.2f} tok/s), GEMM = {dt/dtot*100:.1f} %")
-    if args.ref_tflops:
-        ideal = pf / (args.ref_tflops * 1e12) * 1e6
+    if args.ref_tflops and pre is not None:
+        ideal = pflop / (args.ref_tflops * 1e12) * 1e6
         print(f"prefill GEMM at {args.ref_tflops:g} TFLOPS would take "
               f"{ideal/1e3:.1f} ms (now {pt/1e3:.1f} ms, "
               f"{pt/ideal:.2f}x slower) -> prefill {(ptot-pt+ideal)/1e3:.0f} ms")

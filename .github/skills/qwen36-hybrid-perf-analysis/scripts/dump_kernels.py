@@ -31,7 +31,8 @@ def parse_args():
     p.add_argument("window", nargs="?", default="prefill",
                    help="'prefill' (graph replays removed), 'all' (whole trace, "
                         "for an out=1 prefill-only run), or a decode step index")
-    p.add_argument("--weight-dtype", choices=["mxfp4", "bf16"], default="mxfp4")
+    p.add_argument("--weight-dtype", choices=["mxfp4", "mxfp8", "bf16"],
+                   default="mxfp4")
     p.add_argument("--max-kernel-s", type=float, default=10.0)
     p.add_argument("--graph-block-min", type=int, default=64)
     p.add_argument("--top", type=int, default=14,

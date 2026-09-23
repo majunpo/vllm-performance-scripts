@@ -135,15 +135,20 @@ def sanity(evlist, layers, tags, phase, cfg, wd="mxfp4"):
     want_gdn = cfg["layers"] - want_full
     n_gdn_lin = len(GDN_LINEARS[wd])
     n_quant = 0 if wd == "bf16" else n_gdn_lin * want_gdn + 4 * want_full
+    if wd == "mxfp8":
+        # in_proj_qkvz and in_proj_ba read the same hidden state and there is no
+        # per-linear rotation, so one quantise launch feeds both
+        n_quant -= want_gdn
     # a fused fwht_quant kernel writes the E8M0 scales itself, so the separate
     # cast kernel disappears -- still one quantise launch per quantised linear
     n_cast = 0 if fused_hadamard_quant(evlist) else n_quant
+    quant_cat = "Quantize(mxfp8)" if wd == "mxfp8" else "Quantize(mxfp4)"
     checks = [
         ("gdn layers", n_gdn, want_gdn),
         ("full layers", n_full, want_full),
         ("Dense-GEMM", cats["Dense-GEMM"][0],
          n_gdn_lin * want_gdn + 4 * want_full + 1),
-        ("Quantize(mxfp4)", cats["Quantize(mxfp4)"][0], n_quant),
+        (quant_cat, cats[quant_cat][0], n_quant),
         ("Quant-scale cast", cats["Quant-scale cast"][0], n_cast),
         ("Activation(SiLU)", cats["Activation(SiLU)"][0], cfg["layers"]),
         ("KVCache-Write", cats["KVCache-Write"][0], want_full),
@@ -158,9 +163,19 @@ def sanity(evlist, layers, tags, phase, cfg, wd="mxfp4"):
         ok &= got == want
         print(f"  [{flag}] {name:<22} got={got:<6} expected={want}")
     if not ok:
-        print("  !! counts are off -- the step window is clipped, the CFG does "
-              "not match the model, or the kernel markers changed;")
-        print("  !! do not trust the numbers below (see references/pitfalls.md)")
+        if (n_gdn + n_full == want_gdn + want_full
+                and all(got == want for _, got, want in checks[2:])):
+            print("  !! only the layer-type split is off. Every per-kernel count "
+                  "is exact, so the window is complete and the category tables "
+                  "are valid;")
+            print("  !! the graph partitioner rotated this forward pass, leaving "
+                  "one layer's attention block in a neighbouring segment. Only "
+                  "the ms/layer row is affected.")
+        else:
+            print("  !! counts are off -- the step window is clipped, the CFG "
+                  "does not match the model, or the kernel markers changed;")
+            print("  !! do not trust the numbers below (see "
+                  "references/pitfalls.md)")
     if cats["Dense-GEMM"][0] != n_gdn_lin * want_gdn + 4 * want_full + 1:
         print("  !! Dense-GEMM is off: the gemm_kernel work-group shapes in "
               "hybrid_common (MAIN_GEMM_LOCAL / DECODE_MAIN_LOCAL) probably do "
@@ -186,10 +201,15 @@ def main():
     p.add_argument("--graph-block-min", type=int, default=64,
                    help="a timestamp shared by at least this many kernels is a "
                         "collapsed XPU-Graph replay")
-    p.add_argument("--weight-dtype", choices=("mxfp4", "bf16"), default="mxfp4",
+    p.add_argument("--weight-dtype", choices=("mxfp4", "mxfp8", "bf16"),
+                   default="mxfp4",
                    help="checkpoint weight dtype; bf16 has no Hadamard rotation "
-                        "or activation quantisation and fuses the GDN in_proj")
+                        "or activation quantisation and fuses the GDN in_proj; "
+                        "mxfp8 (compressed-tensors) has no rotation either")
     p.add_argument("--max-name", type=int, default=96)
+    p.add_argument("--decode-only", action="store_true",
+                   help="the profiler window holds pure decode steps and no "
+                        "prefill (run_auto_model_xpu-bs-decode-only.py)")
     p.add_argument("--no-detail", action="store_true")
     args = p.parse_args()
 
@@ -213,48 +233,62 @@ def main():
           "deliberately not attempted.")
 
     wins = step_windows(evs)
-    if len(wins) < 2:
+    d0 = 0 if args.decode_only else 1
+    if len(wins) < 1 + d0:
         sys.exit("need at least one prefill and one decode window "
                  "(out=1 trace? use analyze_prefill_only.py)")
-    print(f"\nforward passes detected: {len(wins)} "
-          f"(window 0 = prefill, 1..{len(wins)-1} = decode)")
-
     pf = prefill_window_indices(evs, wins)
-    batch = detect_batch(evs, wins)
-    tokens = detect_prompt_len(evs[wins[0][0]:wins[0][1]])
-    print(f"workload: prompt={tokens} tokens, batch={batch} "
-          f"(both read off the KV-write ND-range)")
-    if len(pf) > 1:
-        print(f"\n!! {len(pf)} windows contain a full prefill FMHA: {pf}")
-        print("!! chunked prefill split the prompt across several forward "
-              "passes (prompt > max_num_batched_tokens).")
-        print("!! Window 0 is only the FIRST chunk and the other chunks are "
-              "being counted as decode steps --")
-        print("!! the prefill and decode numbers below are both wrong. "
-              "Re-capture with a larger --max-num-batched-tokens,")
-        print("!! or analyse each chunk separately with dump_kernels.py.")
+    batch = detect_batch(evs, wins, first=d0)
 
-    # ---- prefill -------------------------------------------------------
-    plo, phi = wins[0]
-    pre, alien = split_graph_blocks(evs, plo, phi, args.graph_block_min)
-    if alien:
-        print(f"\n!! {len(alien)} kernels ({sum(e[1] for e in alien)/1e3:.3f} ms) "
-              f"inside the prefill window carry a collapsed graph timestamp and "
-              f"belong to a\n!! decode replay that was submitted while the "
-              f"prefill was still running. They are excluded from the prefill.")
-    players, ptags = walk_layers(pre, cfg, wd)
-    sanity(pre, players, ptags, "PREFILL", cfg, wd)
+    if args.decode_only:
+        print(f"\nforward passes detected: {len(wins)} (decode-only capture, "
+              f"all windows are decode steps)")
+        if pf:
+            sys.exit(f"windows {pf} contain a full prefill FMHA kernel -- this "
+                     f"is not a decode-only trace, drop --decode-only")
+        print(f"workload: batch={batch} (read off the KV-write ND-range); "
+              f"prompt length is not observable in a decode-only trace")
+        pre = players = ptags = None
+        tokens = None
+    else:
+        print(f"\nforward passes detected: {len(wins)} "
+              f"(window 0 = prefill, 1..{len(wins)-1} = decode)")
+        tokens = detect_prompt_len(evs[wins[0][0]:wins[0][1]])
+        print(f"workload: prompt={tokens} tokens, batch={batch} "
+              f"(both read off the KV-write ND-range)")
+        if len(pf) > 1:
+            print(f"\n!! {len(pf)} windows contain a full prefill FMHA: {pf}")
+            print("!! chunked prefill split the prompt across several forward "
+                  "passes (prompt > max_num_batched_tokens).")
+            print("!! Window 0 is only the FIRST chunk and the other chunks are "
+                  "being counted as decode steps --")
+            print("!! the prefill and decode numbers below are both wrong. "
+                  "Re-capture with a larger --max-num-batched-tokens,")
+            print("!! or analyse each chunk separately with dump_kernels.py.")
+
+        # ---- prefill ---------------------------------------------------
+        plo, phi = wins[0]
+        pre, alien = split_graph_blocks(evs, plo, phi, args.graph_block_min)
+        if alien:
+            print(f"\n!! {len(alien)} kernels "
+                  f"({sum(e[1] for e in alien)/1e3:.3f} ms) "
+                  f"inside the prefill window carry a collapsed graph timestamp "
+                  f"and belong to a\n!! decode replay that was submitted while "
+                  f"the prefill was still running. They are excluded from the "
+                  f"prefill.")
+        players, ptags = walk_layers(pre, cfg, wd)
+        sanity(pre, players, ptags, "PREFILL", cfg, wd)
 
     # ---- decode --------------------------------------------------------
     # pick a complete decode window: the modal kernel count
     sizes = {}
-    for k, (lo, hi) in enumerate(wins[1:], start=1):
+    for k, (lo, hi) in enumerate(wins[d0:], start=d0):
         sizes.setdefault(hi - lo, []).append(k)
     modal = max(sizes, key=lambda s: len(sizes[s]))
     good = sizes[modal]
-    print(f"\ncomplete decode steps: {len(good)} of {len(wins)-1} "
+    print(f"\ncomplete decode steps: {len(good)} of {len(wins)-d0} "
           f"({modal} kernels each); incomplete windows "
-          f"{[k for k in range(1, len(wins)) if k not in good]} are skipped "
+          f"{[k for k in range(d0, len(wins)) if k not in good]} are skipped "
           f"(graph replay straddles the sampler boundary)")
 
     dk = good[min(args.decode_step, len(good) - 1)]
@@ -264,8 +298,6 @@ def main():
     sanity(dec, dlayers, dtags, f"DECODE step #{dk}", cfg, wd)
 
     # ---- aggregate -----------------------------------------------------
-    pcats, _ = tally(pre, wd)
-    ptotal = sum(v[1] for v in pcats.values())
     dagg = defaultdict(lambda: [0, 0.0])
     dtotal = 0.0
     for k in good:
@@ -277,22 +309,27 @@ def main():
             dtotal += dur
 
     print(f"\n{'='*118}\nOVERVIEW\n{'='*118}")
-    print(f"prefill              : {ptotal/1e3:10.3f} ms"
-          + (f"  ({tokens} tokens -> {tokens*1e6/ptotal:.0f} tok/s)"
-             if tokens else ""))
+    if pre is not None:
+        pcats, _ = tally(pre, wd)
+        ptotal = sum(v[1] for v in pcats.values())
+        print(f"prefill              : {ptotal/1e3:10.3f} ms"
+              + (f"  ({tokens} tokens -> {tokens*1e6/ptotal:.0f} tok/s)"
+                 if tokens else ""))
     print(f"decode               : {dtotal/1e3:10.3f} ms over {len(good)} steps "
           f"-> {dtotal/len(good)/1e3:.3f} ms/step "
           f"({(batch or 1)*1e6*len(good)/dtotal:.2f} tok/s at bs={batch or '?'})")
 
-    print_categories(pcats, "PREFILL categories", ptotal)
-    print_layer_split(pre, players, "PREFILL")
+    if pre is not None:
+        print_categories(pcats, "PREFILL categories", ptotal)
+        print_layer_split(pre, players, "PREFILL")
     print_categories(dagg, f"DECODE categories ({len(good)} complete steps)",
                      dtotal, per_step=len(good))
     print_layer_split(dec, dlayers, f"DECODE step #{dk}")
 
     if not args.no_detail:
-        print_step_detail(pre, "SINGLE PREFILL STEP (exact)", args.max_name,
-                          ptags, wd)
+        if pre is not None:
+            print_step_detail(pre, "SINGLE PREFILL STEP (exact)", args.max_name,
+                              ptags, wd)
         print_step_detail(dec, f"SINGLE DECODE STEP #{dk} (exact)",
                           args.max_name, dtags, wd)
 

@@ -122,11 +122,11 @@ def parse_gemm_xpu(lines, decode):
             if decode:                 # linear K N calls med min MB_w GB/s GB/s@min ms
                 rows[col[0]] = dict(K=int(col[1]), N=int(col[2]), calls=int(col[3]),
                                     us=float(col[4]), metric=float(col[7]),
-                                    ms=float(col[9]))
+                                    gbs=float(col[7]), ms=float(col[9]))
             else:                      # linear M K N calls med GFLOP MB TFLOPS GB/s ms
                 rows[col[0]] = dict(K=int(col[2]), N=int(col[3]), calls=int(col[4]),
                                     us=float(col[5]), metric=float(col[8]),
-                                    ms=float(col[10]))
+                                    gbs=float(col[9]), ms=float(col[10]))
         except (ValueError, IndexError):
             continue
     return rows
@@ -143,7 +143,7 @@ def parse_gemm_nv(lines, decode):
             rows[col[0]] = dict(backend=col[1], K=int(col[2]), N=int(col[3]),
                                 calls=int(col[4]), us=float(col[5]),
                                 metric=float(col[9] if decode else col[8]),
-                                ms=float(col[10]))
+                                gbs=float(col[9]), ms=float(col[10]))
         except (ValueError, IndexError):
             continue
     return rows
@@ -220,16 +220,17 @@ def parse_nv(path):
 
     m = re.search(r"^device\s*:\s*(.+?)\s*$", t, re.M)
     d["device"] = m.group(1) if m else None
-    m = re.search(r"^load\s*:\s*prompt=(\d+), batch=(\d+)", t, re.M)
+    m = re.search(r"^load\s*:\s*prompt=(\d+)[^,]*, batch=(\d+)", t, re.M)
     if m:
         d["tokens"], d["batch"] = int(m.group(1)), m.group(2)
-    m = re.search(r"^prefill\s+: window\s+([\d.]+) ms\s+kernels\s+([\d.]+) ms"
+    # `window` was renamed to `period` when the step time moved to start-to-start
+    m = re.search(r"^prefill\s+: (?:window|period)\s+([\d.]+) ms\s+kernels\s+([\d.]+) ms"
                   r"\s+\(([\d.]+)% busy\)\s+->\s+(\d+) tok/s", t, re.M)
     if m:
         d["prefill_wall"] = float(m.group(1))
         d["prefill_ms"] = float(m.group(2))
         d["prefill_busy"] = float(m.group(3))
-    m = re.search(r"^decode / step\s+: window\s+([\d.]+) ms\s+kernels\s+([\d.]+) ms"
+    m = re.search(r"^decode / step\s+: (?:window|period)\s+([\d.]+) ms\s+kernels\s+([\d.]+) ms"
                   r"\s+\(([\d.]+)% busy\)\s+->\s+([\d.]+) tok/s", t, re.M)
     if m:
         d["decode_wall"] = float(m.group(1))
@@ -338,8 +339,17 @@ def category_table(xa, nb, xtot, ntot, noise, out):
     return gap
 
 
-def gemm_table(xg, ng, unit, out):
+# Linears that run at M=1 in *both* phases, so they are memory bound even in
+# prefill and TFLOPS says nothing about them -- compare their bandwidth instead.
+M1_LINEARS = {"lm_head"}
+
+
+def gemm_table(xg, ng, unit, out, xpu_backend="—"):
     """Per-linear side by side. Both TFLOPS and GB/s are higher-is-better.
+
+    `analyze_hybrid_gemm.py` has no backend column -- on Intel every linear is
+    served by the same `gemm_kernel` and only the ND-range differs -- so the A
+    backend comes from `--xpu-backend`.
 
     Flags the row the XPU layer-walker inflates: when `in_proj_ba` is present
     on one side only, the other side folded it into `in_proj_qkvz`, doubling
@@ -348,19 +358,33 @@ def gemm_table(xg, ng, unit, out):
     merged = "in_proj_ba" in ng and "in_proj_ba" not in xg
     order = sorted(set(xg) | set(ng),
                    key=lambda k: -(xg.get(k, {}).get("ms", 0.0)))
-    out.append(f"| linear | K | N | A µs/层 | **A {unit}** | B µs/层 | "
-               f"**B {unit}** | B 后端 | B 领先 |")
-    out.append("|---|---:|---:|---:|---:|---:|---:|---|---:|")
+    out.append(f"| linear | K | N | A 后端 | A µs/层 | **A {unit}** | "
+               f"B 后端 | B µs/层 | **B {unit}** | B 领先 |")
+    out.append("|---|---:|---:|---|---:|---:|---|---:|---:|---:|")
+    m1_seen = False
     for k in order:
         x, n = xg.get(k, {}), ng.get(k, {})
-        r = ratio(n.get("metric"), x.get("metric"))
+        xm, nm, suffix = x.get("metric"), n.get("metric"), ""
+        if unit == "TFLOPS" and k in M1_LINEARS:
+            xm, nm, suffix, m1_seen = x.get("gbs"), n.get("gbs"), " GB/s", True
+        r = ratio(nm, xm)
         flag = " ⚠" if merged and k == "in_proj_qkvz" else ""
         out.append(
             f"| `{k}`{flag} | {x.get('K') or n.get('K') or '—'} | "
-            f"{x.get('N') or n.get('N') or '—'} | {f(x.get('us'), '.1f')} | "
-            f"{f(x.get('metric'), '.1f')} | {f(n.get('us'), '.1f')} | "
-            f"**{f(n.get('metric'), '.1f')}** | {n.get('backend', '—')} | "
-            f"{f(r, '.2f')}× |")
+            f"{x.get('N') or n.get('N') or '—'} | "
+            f"{x.get('backend', xpu_backend) if x else '—'} | "
+            f"{f(x.get('us'), '.1f')} | {f(xm, '.1f')}{suffix} | "
+            f"{n.get('backend', '—')} | {f(n.get('us'), '.1f')} | "
+            f"**{f(nm, '.1f')}{suffix}** | {f(r, '.2f')}× |")
+    if m1_seen:
+        out += ["",
+                "> `lm_head` 在 prefill 也只做 **M=1**（一次前向只出 1 个 token），"
+                "是**访存受限**的，所以该行比的是 **GB/s** 而不是 TFLOPS —— "
+                "它同时是两侧 trace 自带的**带宽参照 kernel**（BF16，不走量化路径）。",
+                "> 其余行在 prefill 都是 M=4000 的计算受限 GEMM，比 TFLOPS 才有意义；"
+                "两侧 prefill 的 GB/s 列字节模型不同（A 含激活与输出，B 只算权重），"
+                "**不能拿其它行的 GB/s 横向对比**；M=1 时激活项可忽略（< 0.05 %），"
+                "所以 `lm_head` 这一行是可比的。"]
     if merged:
         out += ["",
                 "> ⚠ A 侧的 layer-walker 把 `in_proj_qkvz` 和 `in_proj_ba` 合并成了"
@@ -397,6 +421,10 @@ def main():
     p.add_argument("--nv", required=True, help="analyze_nv_hybrid_trace.txt")
     p.add_argument("--xpu-name", default="Intel XPU")
     p.add_argument("--nv-name", default="NVIDIA")
+    p.add_argument("--xpu-backend", default="—",
+                   help="A-side GEMM backend label for the per-shape tables; "
+                        "analyze_hybrid_gemm.py has no backend column because "
+                        "every Intel linear uses the same `gemm_kernel`")
     p.add_argument("--title", default="Qwen3.6-27B 推理性能对比")
     p.add_argument("-o", "--output", required=True,
                    help="suffix it with the XPU trace timestamp; never overwrite "
@@ -443,7 +471,8 @@ def main():
           "| Trace | <文件名>（unitrace） | <文件名>（PyTorch Profiler） |",
           "| 模型 | <layers / hidden / inter / vocab / GDN 与 full 的拆分> | 同左 |",
           "| 权重+激活量化 | <格式，group size，W?A?> | <格式，是否 MIXED_PRECISION> |",
-          "| GEMM 后端 | <库 + kernel 家族> | "
+          "| GEMM 后端 | "
+          + (a.xpu_backend if a.xpu_backend != "—" else "<库 + kernel 家族>") + " | "
           + (" / ".join(n.get("backends_decode", {})) or "<后端>") + " |",
           "| **Full attention** | <库 + kernel（prefill / decode / reduce）> | "
           "<库 + kernel> |",
@@ -488,7 +517,8 @@ def main():
                           NOISE_MS_PREFILL, o)
     o += ["", "### 2.1 prefill GEMM 逐 shape（TFLOPS）", ""]
     if x["gemm"].get("prefill"):
-        gemm_table(x["gemm"]["prefill"], n["gemm"]["prefill"], "TFLOPS", o)
+        gemm_table(x["gemm"]["prefill"], n["gemm"]["prefill"], "TFLOPS", o,
+                   a.xpu_backend)
         o += ["", f"**合计**：A **{f(x['aggregate'].get('prefill_tflops'), '.1f')} TFLOPS**"
               + ("（已按时长聚类修正 `in_proj_qkvz`/`in_proj_ba` 的合并）"
                  if x["aggregate"].get("prefill_corrected") else "")
@@ -520,7 +550,8 @@ def main():
                           NOISE_MS_DECODE, o)
     o += ["", "### 3.1 decode GEMM 逐 shape（GB/s）", ""]
     if x["gemm"].get("decode"):
-        gemm_table(x["gemm"]["decode"], n["gemm"]["decode"], "GB/s", o)
+        gemm_table(x["gemm"]["decode"], n["gemm"]["decode"], "GB/s", o,
+                   a.xpu_backend)
         xq = x["aggregate"]
         o += ["", f"**合计**：A **{f(xq.get('decode_gbs'), '.1f')} GB/s**"
               + (f"（仅量化 linear **{f(xq.get('decode_quant_gbs'), '.1f')} GB/s**）"
@@ -560,10 +591,12 @@ def main():
     # ---- 4 gap ----------------------------------------------------------
     o += ["## 4. gap 分解汇总", "",
           f"prefill 总差 **{f(pgap, '+.3f')} ms**（**{f(ratio(x.get('prefill_ms'), n.get('prefill_ms')), '.2f')}×**），"
-          f"decode 总差 **{f(dgap, '+.3f')} ms**（**{f(dr, '.2f')}×**）。", "",
-          "| 类别 | prefill B 领先 | prefill 差值 ms | 占 prefill gap | "
-          "decode B 领先 | decode 差值 ms | 占 decode gap |",
-          "|---|---:|---:|---:|---:|---:|---:|"]
+          f"decode 总差 **{f(dgap, '+.3f')} ms**（**{f(dr, '.2f')}×**）。",
+          "",
+          "> **\"占 gap\" 的分母是*净*差值**，而净差值是正负相抵之后的结果，"
+          "所以**单项可以超过 100 %**：某一类 A 慢得越多、而另一类 A 反而更快时，"
+          "前者占净 gap 的比例就会 > 100 %。每张表都给出了**正/负贡献小计**，"
+          "先看小计再看单项。", ""]
     allk = set(x["categories"]["prefill"]) | set(n["categories"]["prefill"]) | \
         set(x["categories"]["decode"]) | set(n["categories"]["decode"])
 
@@ -581,21 +614,31 @@ def main():
         if not a:
             return "A 无"
         return f"{a/b:.2f}×"
-    for k in sorted(allk, key=lambda k: -(abs(diff("prefill", k)) / max(abs(pgap), 1e-9)
-                                          + abs(diff("decode", k)) / max(abs(dgap), 1e-9))):
-        dp, dd = diff("prefill", k), diff("decode", k)
-        if abs(dp) < NOISE_MS_PREFILL and abs(dd) < NOISE_MS_DECODE:
-            continue
-        o.append(f"| {k} | {rat2('prefill', k)} | {dp:+.3f} | "
-                 f"{f(pct(dp, pgap), '.1f')} % | {rat2('decode', k)} | "
-                 f"{dd:+.3f} | {f(pct(dd, dgap), '.1f')} % |")
-    o += ["",
-          "> \u6bd4\u503c < 1 \u7684\u9879 = **A \u66f4\u5feb**，要在报告里明确指出，不要只报差距。",
+
+    def gap_table(phase, gap, noise, label):
+        rows = [(k, diff(phase, k)) for k in allk if abs(diff(phase, k)) >= noise]
+        rows.sort(key=lambda kv: -abs(kv[1]))
+        pos = sum(d for _, d in rows if d > 0)
+        neg = sum(d for _, d in rows if d < 0)
+        o.extend([f"### 4.{label[0]} {label[1]}", "",
+                  "| 类别 | B 领先 | 差值 ms | 占净 gap |", "|---|---:|---:|---:|"])
+        for k, d in rows:
+            o.append(f"| {k} | {rat2(phase, k)} | {d:+.3f} | "
+                     f"{f(pct(d, gap), '.1f')} % |")
+        o.extend([f"| **小计：A 更慢的部分** | | **{pos:+.3f}** | "
+                  f"**{f(pct(pos, gap), '.1f')} %** |",
+                  f"| **小计：A 更快的部分** | | **{neg:+.3f}** | "
+                  f"**{f(pct(neg, gap), '.1f')} %** |",
+                  f"| **净 gap** | | **{gap:+.3f}** | **100 %** |", ""])
+
+    gap_table("prefill", pgap, NOISE_MS_PREFILL, ("1", "PREFILL"))
+    gap_table("decode", dgap, NOISE_MS_DECODE, ("2", "DECODE"))
+    o += ["> 比值 < 1 的项 = **A 更快**，要在报告里明确指出，不要只报差距。",
           "> 同一个类别在 prefill 和 decode 的比值常常差很多（计算受限 vs 访存受限），"
-          "两列要分开解读。", "",
-          "### 每个 gap 的根因判定（人工填写）", "",
-          "| gap | 根因（软件问题 / 硬件规格 / 实现成熟度） | 证据 |",
-          "|---|---|---|", "| <最大项> | | |", "", ""]
+          "两张表要分开解读。", "",
+          "### 4.3 每个 gap 的根因判定（人工填写）", "",
+          "| gap | 差值 | 根因（软件问题 / 硬件规格 / 实现成熟度） | 证据 |",
+          "|---|---:|---|---|", "| <最大项> | | | |", "", ""]
 
     # ---- 5 checklist ----------------------------------------------------
     o += ["## 5. 仍需人工补充的部分", "",

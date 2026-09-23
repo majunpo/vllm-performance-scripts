@@ -21,7 +21,7 @@ except ImportError:                                       # pragma: no cover
 # --------------------------------------------------------------------------
 
 CFG = dict(
-    name="Qwen3.6-27B",
+    name="Qwen3.6/3.8-27B (qwen3_5_text)",
     hidden=5120,
     layers=64,
     full_attention_interval=4,      # layer_types: 3 x linear_attention + 1 x full
@@ -42,7 +42,14 @@ CFG = dict(
 )
 
 MXFP4_BYTES = 0.5 + 1.0 / 32        # 4-bit element + one uint8 E8M0 per 32
+MXFP8_BYTES = 1.0 + 1.0 / 32        # 8-bit element + one uint8 E8M0 per 32
 BF16_BYTES = 2.0
+
+
+def weight_bytes(weight_dtype):
+    if weight_dtype == "bf16":
+        return BF16_BYTES
+    return MXFP8_BYTES if weight_dtype == "mxfp8" else MXFP4_BYTES
 
 
 def derive(cfg=CFG):
@@ -112,6 +119,7 @@ def layer_kinds(cfg=CFG):
 
 GDN_LINEARS = {
     "mxfp4": ["in_proj_qkvz", "in_proj_ba", "gdn_out_proj", "gate_up", "down_proj"],
+    "mxfp8": ["in_proj_qkvz", "in_proj_ba", "gdn_out_proj", "gate_up", "down_proj"],
     "bf16": ["in_proj", "gdn_out_proj", "gate_up", "down_proj"],
 }
 FULL_LINEARS = ["qkv_proj", "o_proj", "gate_up", "down_proj"]
@@ -130,7 +138,10 @@ FULL_LINEARS = ["qkv_proj", "o_proj", "gate_up", "down_proj"]
 #          the segment's contents instead of the marker name
 RE_NORM_IN = re.compile(r"_fused_add_rms_norm(_mm_view)?_3$")
 RE_NORM_POST = re.compile(r"_fused_add_rms_norm(_mm_view)?_1$")
-RE_GDN_GATED_NORM = re.compile(r"rsqrt_silu(_t)?_view_0$")
+# a compressed-tensors MXFP8 build fuses the next linear's quantise into the
+# gated-norm kernel, appending `_xpu_mxfp8_quantize_<n>` to the same name
+RE_GDN_GATED_NORM = re.compile(
+    r"rsqrt_silu(_t)?_view_0$|rsqrt_silu(_t)?_view_xpu_mxfp[48]_quantize_[0-9]+$")
 RE_FULL_OUT_GATE = re.compile(r"fused_(mm_)?mul_sigmoid_view_0$")
 RE_SILU = re.compile(r"fused_(mm_)?mul_silu_slice(_view)?_2$")
 RE_GDN_STATE = re.compile(r"triton_poi_fused_zeros_[0-9]+$")
@@ -186,9 +197,10 @@ def is_gemm(name):
 def is_main_gemm(name, weight_dtype="mxfp4"):
     """Distinguish a model linear from a Hadamard-rotation matmul.
 
-    A BF16 checkpoint has no rotation_config, so every gemm_kernel is a linear.
+    Neither a BF16 checkpoint nor a compressed-tensors MXFP8 one has a
+    rotation_config, so there every gemm_kernel is a linear.
     """
-    if weight_dtype == "bf16":
+    if weight_dtype in ("bf16", "mxfp8"):
         return True
     nd = nd_range(name)
     if nd is None:
@@ -206,9 +218,9 @@ def base_name(name):
 
 
 def is_tiny_gemm(name):
-    """A decode GEMM launched with a single work-group: only in_proj_ba (N=96)."""
+    """A GEMM launched with a single work-group along N: only in_proj_ba (N=96)."""
     nd = nd_range(name)
-    return bool(nd) and nd[0] == (1, 1, 1) and nd[1] == (128, 4, 1)
+    return bool(nd) and nd[0][0] == 1 and nd[1] in ((128, 4, 1), (64, 4, 2))
 
 
 def bucket(full, weight_dtype="mxfp4"):
@@ -231,7 +243,7 @@ def bucket(full, weight_dtype="mxfp4"):
     if RE_GDN_GATED_NORM.search(name):
         return "GDN-Norm/Gate"
     if RE_QUANT.search(name):
-        return "Quantize(mxfp4)"
+        return "Quantize(mxfp8)" if weight_dtype == "mxfp8" else "Quantize(mxfp4)"
     if RE_SCALE.search(name):
         return "Quant-scale cast"
     if RE_FULL_OUT_GATE.search(name):
@@ -260,6 +272,7 @@ def bucket(full, weight_dtype="mxfp4"):
 CATEGORY_ORDER = [
     "Dense-GEMM", "GDN-Attn(chunk)", "GDN-Attn(recurrent)", "FullAttn-FMHA",
     "FullAttn-SplitK-Reduce", "Hadamard-Rotation", "Quantize(mxfp4)",
+    "Quantize(mxfp8)",
     "Quant-scale cast", "Norm(RMS)", "GDN-Norm/Gate", "QK-Norm/RoPE",
     "Activation(SiLU)", "FullAttn-OutGate", "KVCache-Write", "GDN-State-Init",
     "Sampling", "Sched/Prep", "MemCopy", "Elementwise/Layout", "Other",
@@ -353,14 +366,15 @@ def detect_prompt_len(evlist):
     return max(seen) if seen else None
 
 
-def detect_batch(evs, wins):
+def detect_batch(evs, wins, first=1):
     """Sequences in a decode step, from the modal decode KV-write ND-range.
 
     Equals `--batch`; getting it wrong silently scales tok/s and every
-    attention byte count.  Returns None if there is no decode window.
+    attention byte count.  `first` is the index of the first decode window --
+    1 normally, 0 for a decode-only capture.  Returns None if there is none.
     """
     counts = Counter()
-    for lo, hi in wins[1:]:
+    for lo, hi in wins[first:]:
         for _, _, n in evs[lo:hi]:
             if RE_KVWRITE.search(n):
                 nd = nd_range(n)
@@ -511,7 +525,28 @@ def walk_layers(evlist, cfg=CFG, weight_dtype="mxfp4"):
             continue
         tags[i] = _gemm_role(evlist, i, kind_at.get(i, "gdn"), weight_dtype,
                              order)
+    _split_in_proj_pair(evlist, tags)
     return layers, tags
+
+
+def _split_in_proj_pair(evlist, tags):
+    """Separate in_proj_qkvz from in_proj_ba on the grid instead of the local size.
+
+    Inside a graph replay the local work-group size reads {0; 0; 0}, so
+    is_tiny_gemm() silently merges the pair and in_proj_ba's 0.5 MB gets billed
+    as in_proj_qkvz's 86 MB.  The two shapes always differ in grid[0]; when they
+    do not (one backend launches every prefill GEMM with the same grid) this
+    leaves the walker's answer alone and duration clustering remains the split.
+    """
+    idx = [i for i, t in tags.items() if t in ("in_proj_qkvz", "in_proj_ba")]
+    grids = {nd_range(evlist[i][2])[0][0] for i in idx if nd_range(evlist[i][2])}
+    if len(grids) != 2:
+        return
+    small = min(grids)
+    for i in idx:
+        nd = nd_range(evlist[i][2])
+        if nd:
+            tags[i] = "in_proj_ba" if nd[0][0] == small else "in_proj_qkvz"
 
 
 def _segment_kind(evlist, lo, hi):

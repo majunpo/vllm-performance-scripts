@@ -31,7 +31,8 @@ def parse_args():
     p.add_argument("--prompt-len", type=int, default=0,
                    help="prompt tokens; autodetected from the prefill KV-write "
                         "ND-range when omitted")
-    p.add_argument("--weight-dtype", choices=["mxfp4", "bf16"], default="mxfp4")
+    p.add_argument("--weight-dtype", choices=["mxfp4", "mxfp8", "bf16"],
+                   default="mxfp4")
     p.add_argument("--max-kernel-s", type=float, default=10.0)
     p.add_argument("--top", type=int, default=12)
     p.add_argument("--max-name", type=int, default=110)

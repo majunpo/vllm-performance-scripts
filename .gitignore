@@ -29,7 +29,7 @@ gsm8k_*.log
 
 # analysis output -- internal only, keep out of the public repo.
 # Use `git add -f` if a specific report should ever be published.
-perf-report.md
+perf-report*.md
 xpu-vs-nv-comparison*.md
 analyze_*.txt
 analyze_*.err
@@ -38,3 +38,8 @@ bench_mxfp4_vs_bf16.txt
 analysis.txt
 gemm_shapes.txt
 profiler_out_*.txt
+*.csv
+nsys-rep/
+*.nsys-rep
+*.sqlite
+*.ncu-rep

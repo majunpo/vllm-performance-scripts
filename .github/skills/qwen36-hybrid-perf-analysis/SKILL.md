@@ -131,6 +131,22 @@ Also check `quantization_config`: `MXFP4_BYTES` must be `bits/8 + 1/group_size`
 true, expect a chain of extra `gemm_kernel` launches in front of every
 quantized linear — the scripts bucket those as `Hadamard-Rotation`.
 
+A **compressed-tensors MXFP8** checkpoint (`"format": "mxfp8-quantized"`,
+`num_bits: 8, group_size: 32`, no `rotation_config`) is a third precision:
+pass `--weight-dtype mxfp8`. It differs from the MXFP4/AutoRound-HMT path in
+three ways the scripts already handle:
+
+| | MXFP4 + online Hadamard | compressed-tensors MXFP8 |
+|---|---|---|
+| byte model | `0.5 + 1/32` | `1 + 1/32` |
+| rotation | 1168 extra `gemm_kernel` per forward | **none** — every `gemm_kernel` is a linear |
+| quantise launches | `5G + 4F` | `4G + 4F` — `in_proj_qkvz` and `in_proj_ba` read the same hidden state and share one `per_token_group_quant_8bit_vec_kernel` |
+| GEMM work-group | `{128;4;1}` / `{64;8;1}` | `{32;8;1}`, `{64;4;2}` for `in_proj_ba`, `{32;2;8}` for `lm_head` |
+
+Because there is no rotation, `is_main_gemm()` accepts every `gemm_kernel`, so a
+new work-group shape cannot silently move GEMMs into `Hadamard-Rotation`.
+The per-linear split then comes from the grid, which is `N/16` for this backend.
+
 `--batch` and `--prompt-len` are usually encoded in the directory name
 (`...-in3300-out20-bs1-tp1`). Dependency: `pip install ijson`.
 
@@ -175,6 +191,42 @@ On the reference pair they also cross-validate the `out=20` report: after the
 misplaced replay is removed the two prefill breakdowns agree to **0.17 %**.
 Always state that comparison in the report.
 
+### Decode-only traces
+
+`run_auto_model_xpu-bs-decode-only.py` drains the prefill, settles, and only
+then opens the profiler window, so the trace holds **nothing but decode steps**
+and the "window 0 = prefill" model does not apply. Pass `--decode-only`:
+
+```bash
+python analyze_hybrid_trace.py $T --decode-only --decode-step 8 > $D/analyze_hybrid_trace.txt
+python analyze_hybrid_gemm.py  $T --decode-only --prompt-len 4000 --ref-bw 1200 > $D/analyze_hybrid_gemm.txt
+```
+
+`analyze_hybrid_gemm.py` then **requires `--prompt-len`** — there is no prefill
+KV-write to read the context length from. Both scripts refuse the flag if the
+trace does contain a prefill FMHA kernel.
+
+What this capture buys that an `out>1` trace cannot give:
+
+- **step-to-step variance** over a long run of identical steps (0.32 % on the
+  reference trace) with no misplaced graph replay to subtract;
+- the driver's own **host-side TPOT**, which can be checked against the device
+  kernel sum. Expect the host number to come out **low**: `engine.step()` submits
+  asynchronously, so over a 20-step window the host finishes ~0.7 steps ahead
+  (43.98 ms host vs 45.57 ms device). Raise `--profile-steps` to 100+ before
+  quoting it.
+
+Everything timestamp-based is *worse* here: the whole trace is graph replay, so
+~91 % of kernels share a stamp and wall/idle analysis is impossible. Do not
+generate the Perfetto timeline for a decode-only trace — it also mislabels
+window 0 as PREFILL.
+
+Two window-selection details matter: the first window usually holds ~2 steps
+(the profiler opened mid-step), and window sizes alternate by ±1 kernel as one
+GEMM moves across the sampler boundary. Pick a window whose `lm_head` count is
+1 — in the others the sampler lands right after a `gate_up`, which is then
+mislabeled as `lm_head`.
+
 For an **unquantized BF16 checkpoint** add `--weight-dtype bf16` to all analysis
 scripts. It switches the byte model to 2 B/element, drops the Hadamard and
 quantize sections, and uses the 4-linear GDN decomposition (a BF16 build fuses
@@ -195,10 +247,25 @@ there; do not copy them into the trace directory.**
 python analyze_nv_hybrid_trace.py $D/rank0.*.pt.trace.json.gz --batch 1
 ```
 
-One script covers everything the two XPU scripts do. Differences to know about:
+One script covers everything the two XPU scripts do, and it auto-detects the
+capture shape: a trace with only a prefill annotation prints
+`-> PREFILL-ONLY trace (out=1)`, one with only decode annotations prints
+`-> DECODE-ONLY trace` and then **requires `--prompt-len`** (a decode-only trace
+records the KV context length nowhere). It also prints the decode period's
+median / min / max / stdev and warns when the mean is skewed — a decode-only
+capture's first period carries the profiler start-up (29.9 ms vs a 25.74 ms
+steady state on the reference trace).
+
+Differences to know about:
 
 - **Phases come from annotations**, not from a sampler kernel:
   `execute_context_<n>(<ctx>)_generation_<m>(<gen>)`. `ctx > 0` is the prefill.
+- **The annotation closes before lm_head and the sampler.** Kernels are therefore
+  assigned to the annotation that most recently *started*, not to its `dur`
+  span, and the decode step time is the **start-to-start period**, not the
+  annotation's `dur`. Clipping on `dur` cost 24 kernels / 9.3 ms of the
+  reference FP8 prefill and made every invariant count come out short; using
+  `dur` as the step time overstates decode throughput by ~9 %.
 - **`cat=overhead` must be excluded.** `Command Buffer Full` shows up in the
   profiler summary as "CUDA total 397.9 ms / 34.6 %" but is a host-side CUPTI
   marker that overlaps real kernels; counting it double-counts the run. Only
@@ -210,9 +277,16 @@ One script covers everything the two XPU scripts do. Differences to know about:
   | kernel | precision | B/element |
   |---|---|---|
   | `marlin::Marlin<...>` | NVFP4, **W4A16** | 0.5625 |
+  | `cutlass_3x_gemm_fp8_blockwise` | FP8 e4m3, `weight_block_size=[128,128]` | 1.000244 |
   | `cudnn_..._matMul_pointwise` | FP8 | 1.0 |
   | `sm89_xmma_gemm_e4m3bf16_...` | FP8 (e4m3) | 1.0 |
   | `internal::gemvx::kernel` / `cutlass_..._bf16_...gemm` | BF16 | 2.0 |
+
+  **Order matters in `BACKENDS`**: `cutlass_3x_gemm_fp8_blockwise` also matches
+  the generic `cutlass\w*gemm` bf16 pattern, so the FP8 entry has to come first
+  or every FP8 shape is billed 2 B/element and the decode bandwidth doubles.
+  The bf16 backends serve **two** linears (`in_proj_ba` and an unquantized
+  `lm_head`); separate them on the layer segment, not on the backend.
 
   **Confirm this against the checkpoint's `quantization_config` rather than
   trusting the mapping blindly** — a ModelOpt export states it outright, and
@@ -237,6 +311,20 @@ One script covers everything the two XPU scripts do. Differences to know about:
 - **Timestamps are trustworthy.** CUPTI times every kernel individually even
   under CUDA Graph, so unlike the XPU side there is no reflow step and idle /
   bubble analysis is valid.
+- **The two norms share one name in an FP8 build.** A Marlin export names the
+  post-attention norm after the GEMM it feeds (`rms_norm..marlin_gemm_view`), but
+  a blockwise-FP8 build emits `..._rms_norm_per_token_group_fp8_quant_permute_*`
+  for both roles. `norm_roles()` decides from what the norm *feeds* — SiLU means
+  post-attention, an attention kernel means the layer's input norm. Without it
+  every layer is split in two and its MLP is parked under `head` (61 % of the
+  reference prefill).
+- **Re-derive the markers whenever the vLLM version moves.** On the FP8 trace
+  five of them had changed: `silu_and_mul_per_block_quant` (SwiGLU **+** quant),
+  `flash_fwd_splitkv_combine` (the split-KV merge, otherwise counted as a second
+  FMHA), `layer_norm_fwd_kernel` (GDN gated norm), `_fused_qk_rmsnorm_rope_gate`
+  (q/k norm + RoPE + gate in one), and `per_token_group_quant_8bit_kernel`
+  (a category that does not exist in a static-scale NVFP4 export).
+  The sanity check catches all of them.
 
 `--ref-tflops` / `--ref-bw` turn the report's headroom estimate from a guess
 into a measurement, and they are **per device** — carrying the old server's
@@ -250,6 +338,14 @@ default to 0 (section omitted). In order of preference, take them from:
 3. the trace's own `lm_head` — it is bf16 and goes through oneDNN in every XPU
    trace, so its decode GB/s is a **lower bound** on what the device delivers,
    and it needs no external input at all. Always report this one regardless.
+
+Known device peaks for the §1 hardware table (still quote "% of the best
+measured kernel on this device" first, "% of vendor peak" second):
+
+| device | BF16 | FP8 | FP4 | bandwidth |
+|---|---:|---:|---:|---:|
+| Intel Xe3 (`vllm_xpu_xe3`, 121.59 GiB) | 299.5 TFLOPS | 599 TFLOPS | 1198 TFLOPS | 1200 GB/s |
+| NVIDIA RTX PRO 5000 72GB Blackwell (`sm_120`, 110 SM) | **258 TFLOPS** | **516 TFLOPS** | — | **1344 GB/s** |
 
 Vendor peak numbers (HBM GB/s, XMX TFLOPS per dtype) belong in the report's
 §1.1 hardware table, but never use them as the efficiency yardstick — quote
@@ -315,6 +411,12 @@ absorbed the Hadamard/quantise (`RE_GDN_GATED_NORM` is matched **before**
 
 Only treat `BAD` as a data problem once the total kernel count also disagrees.
 
+**A rotated window looks like a clipped one but is not.** When only the two
+layer-count lines are `BAD` and every per-kernel count is exact, the graph
+partitioner moved one layer's attention block into a neighbouring segment; the
+window is complete and every category table is valid, only the `ms/layer` row is
+affected. `sanity()` says so explicitly instead of the generic warning.
+
 The NVIDIA script checks the same invariants plus `GDN-Attn(recurrent) = 2G`
 (decode) and `GDN-Attn(chunk)` divisible by `G` (prefill).
 
@@ -335,8 +437,25 @@ Then cross-check the numbers themselves:
 ## Step 3 — Write `perf-report.md`
 
 Put it next to the trace, following
-[references/report-template.md](./references/report-template.md). Mandatory
-content beyond the dense-model report:
+[references/report-template.md](./references/report-template.md).
+
+**Every report must be self-contained.** A trace directory is the unit that gets
+shared: whoever receives it gets the `.json`, the `.txt` artifacts and the
+report, and nothing else. So a report may *compare itself* to another run, but
+it must never *outsource* its own numbers to one. Concretely, every report
+repeats, from its own trace:
+
+- the config table, the category table and the exact single-step tables for
+  every phase the trace contains;
+- the per-shape GEMM table, the GDN kernel table and the attention table;
+- the per-layer cost model and the invariant counts used to sanity-check it;
+- the fusion / kernel-rename table, so the kernel names can be matched later.
+
+Cross-references are for *context only* ("the out=1 trace measures idle better",
+"MXFP4 on the same machine reached 118 TFLOPS") and must always carry the number
+inline. Never write "详见 X 报告" in place of a table.
+
+Mandatory content beyond the dense-model report:
 
 - the **exact single-step tables** (`§3.3` prefill, `§3.4` decode). These are
   the whole point of the report: they are what lets a reader find a hot kernel
@@ -384,13 +503,16 @@ number.
 | The last `..._rms_norm_3` marker is the model's final norm, not a layer start | one phantom 65th layer that swallows `lm_head` |
 | Decode layer 0's Hadamard/quant prologue is emitted at the *end* of the window | layer 0 looks like it has no quantization |
 | Unterminated kernels at trace stop | two `gemm_kernel` events with `dur` ≈ 4.9·10^4 s dwarf the run |
-| In **prefill** the walker merges `in_proj_qkvz` + `in_proj_ba` into one 96-call bucket | that row's GFLOP and the aggregate TFLOPS **double** (137.4 instead of 118.2); fix with `cluster_gemm_durations` |
+| In **prefill** the walker merges `in_proj_qkvz` + `in_proj_ba` into one 96-call bucket | that row's GFLOP and the aggregate TFLOPS **double** (137.4 instead of 118.2); `_split_in_proj_pair` fixes it whenever the two differ in grid[0] (MXFP8), otherwise use `cluster_gemm_durations` |
+| Under a graph replay the local work-group size reads `{0; 0; 0}` | `is_tiny_gemm()` cannot see `in_proj_ba`, so **decode** merges the pair too and its 0.5 MB is billed as 86 MB — the decode aggregate GB/s comes out ~15 % high. Split on grid[0], never on the local size |
 | A fusion renames a marker kernel (`..._inc_ark_mxfp4_hadamard_quant_...`) | a whole category reads 0 and another doubles — fix the regex order in `bucket()`, not in the caller |
 | Reading ND-range work-group size from a **decode** kernel | it is `{0; 0; 0}` inside a graph replay; only the global grid is valid. Quote prefill ND-ranges, or an `out=1` trace |
 | Duration clustering applied to a **decode** window | at M=1 different shapes overlap in duration and merge into meaningless clusters; it is a prefill-only tool |
 | Prompt longer than `max_num_batched_tokens` | chunked prefill emits several prefill forward passes; window 0 is one chunk and the rest are counted as decode steps. Detected via the prefill-FMHA kernel |
 | Assuming `--batch 1` | scales tok/s and every attention byte count; now auto-detected from the decode KV-write ND-range |
 | `out=1` trace fed to `analyze_hybrid_trace.py` | exits with "need at least one prefill and one decode window"; use `analyze_prefill_only.py` |
+| decode-only trace analysed without `--decode-only` | the first decode step is statistically treated as the prefill |
+| quoting the driver's host TPOT from a short decode-only window | async submission puts the host ~0.7 steps ahead; the number comes out ~3 % low |
 
 ## How GEMM Attribution Works
 

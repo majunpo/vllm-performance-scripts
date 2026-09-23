@@ -156,6 +156,10 @@ def main():
                              "(required for long-sequence runs).")
     parser.add_argument("--ep", action="store_true",
                         help="Enable expert parallelism (MoE models); combine with --tp for TP+EP runs.")
+    parser.add_argument("--language-model-only", action="store_true",
+                        help="Same as `vllm serve --language-model-only`: zero out all multimodal "
+                             "limits so hybrid models (Qwen3.5/Qwen3.6, Llama-4, ...) skip loading "
+                             "their multimodal modules and leave more memory for KV cache.")
     parser.add_argument("--enforce-eager", action="store_true",
                         help="Disable XPU graph capture. Graph replay reuses Level Zero events, which can "
                              "make unitrace emit kernels with garbage device timestamps.")
@@ -215,6 +219,7 @@ def main():
         max_num_seqs=args.max_num_seqs,
         enable_chunked_prefill=args.enable_chunked_prefill,
         enable_expert_parallel=args.ep,
+        language_model_only=args.language_model_only,
         enable_prefix_caching=False,
         trust_remote_code=True,
         kv_cache_dtype=args.kv_cache_dtype,
@@ -224,7 +229,8 @@ def main():
     )
 
     print(f"2. Preparing dummy data (bs={args.bs}, in={args.input_len}, out={args.output_len}, "
-          f"phase={args.phase}, kv_cache_dtype={args.kv_cache_dtype})...")
+          f"phase={args.phase}, kv_cache_dtype={args.kv_cache_dtype}, "
+          f"language_model_only={args.language_model_only})...")
     warmup_inputs = [{"prompt_token_ids": [1000 + i] * args.input_len} for i in range(args.bs)]
     profile_inputs = [{"prompt_token_ids": [2000 + i] * args.input_len} for i in range(args.bs)]
 
