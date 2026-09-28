@@ -147,6 +147,48 @@ Because there is no rotation, `is_main_gemm()` accepts every `gemm_kernel`, so a
 new work-group shape cannot silently move GEMMs into `Hadamard-Rotation`.
 The per-linear split then comes from the grid, which is `N/16` for this backend.
 
+### The CUTLASS-SYCL backend (vLLM >= v1146, `XPUMxFp8LinearKernel`)
+
+A newer `vllm-xpu-kernels` build can serve the MXFP8 linears from CUTLASS-SYCL
+instead of oneDNN. The switch is **`VLLM_XPU_MXFP8_USE_SYCLTLA`**, and it is
+**not visible in the log** — `Using XPUMxFp8LinearKernel for MXFP8 GEMM` is
+printed either way. Decide from the trace:
+
+| | oneDNN | CUTLASS-SYCL |
+|---|---|---|
+| kernel name | `gemm_kernel[SIMD16 {N/16; 1; 1} {32; 8; 1}]` | `cutlass::gemm::kernel::GemmUniversal<..., MainloopIntelXeXMX16BlockScaled<2, cute::C<32>, cutlass::gemm::KernelXe, ...>, cute::tuple<cute::C<M>, cute::C<N>, cute::C<K>>, ...>` |
+
+`VLLM_GDN_USE_CUTLASS` is a separate, unrelated flag. The scripts handle both
+GEMM backends, but know what changes:
+
+| | oneDNN build | CUTLASS-SYCL build |
+|---|---|---|
+| quantised linears | `gemm_kernel[...]` | `GemmUniversal<...BlockScaled...>` (256/forward) |
+| `in_proj_ba`, `lm_head` | `gemm_kernel` | **still** `gemm_kernel` (49/forward) |
+| in_proj pair split | grid[0] | **kernel family** — grid[0] inverts between prefill and decode |
+| GEMM shape from the name | ND-range only | ND-range **x tile shape**: `grid = (ceil(M/tileM), ceil(N/tileN))` in prefill, `grid[1]*tileN = N` in decode |
+| GDN chunk prefill | 7 kernels, `gdn::Chunk*` | 4 kernels, `cutlass::gdn::detail::Chunk*` (`ChunkPrepare`+`ComputeA`+`Inverse`+`ComputeWU` fused into `ChunkComputeAO2InvKernel`) |
+| GDN decode | `gdn::gated_delta_rule_kernel` | `cutlass::gdn::detail::recurrent::RecurrentGdnDecodeKernel` |
+| E8M0 scale write | separate `Float8_e8m0` cast, `5G+4F` | fused into `per_token_group_quant_8bit_vec_kernel<..., unsigned char>` -> `Quant-scale cast` is **0** |
+
+**Never name a backend from the vLLM log.** `qwen_gdn_linear_attn.py` prints
+`Using Triton/FLA GDN prefill kernel` on *both* builds even though neither runs
+a Triton GDN kernel — the whole `gdn::`/`cutlass::gdn::` path is hand-written
+SYCL C++, and Triton kernels are the ones named `triton_*`. The old
+`gdn::Chunk*Kernel<cutlass::bfloat16_t, float>` are already CUTLASS-typed; what
+the new build changed is the *implementation* (CUTLASS/CuTe collective, 4-in-1),
+not the language. Only `GDN decode kernel: triton|xpu` tracks a real switch.
+Always state the backend from the kernel names in the trace.
+
+**Measured on Xe3, Qwen3.8-27B-MXFP8, in4000/bs1** — the two GEMM backends are
+**equivalent in prefill** (aggregate 492.2 vs 494.1 TFLOPS, Dense-GEMM 395.757
+vs 394.292 ms, 0.37 %) and differ only in **decode**: 642.6 -> 997.2 GB/s
+(1.55x). Do not attribute a prefill change to the GEMM backend, and never mix
+per-shape GEMM rows from two traces that used different backends. Only the
+`Quantize` category also moves (+6.2 % under SYCL-TLA), because
+`input_scale_transposed()` changes the activation-scale layout.
+
+
 `--batch` and `--prompt-len` are usually encoded in the directory name
 (`...-in3300-out20-bs1-tp1`). Dependency: `pip install ijson`.
 
@@ -457,6 +499,16 @@ inline. Never write "详见 X 报告" in place of a table.
 
 Mandatory content beyond the dense-model report:
 
+- a **§1.2.1 "where these dimensions come from"** section. The model-topology
+  table alone (`qkv_proj N = 24·256·2 + 2·4·256`) is unreadable to anyone who
+  has not read the modelling code. Derive each width from the `config.json`
+  field names, one row per segment, and tie it back to a trace ND-range:
+  `qkv_proj` N = `Hq·D·2 + 2·Hkv·D` (the ·2 is `attn_output_gate`),
+  `in_proj_qkvz` N = `2·Kh·Dk + 2·Vh·Dv` (q,k on key heads; v,z on value heads),
+  `in_proj_ba` N = `2·Vh` (beta/alpha, one scalar per value head),
+  `conv_dim` = `2·Kh·Dk + Vh·Dv` (q,k,v go through the conv, **z does not** —
+  the difference to `in_proj_qkvz` is exactly the z gate),
+  recurrent state = `[Vh, Dv, Dk]` fp32 (outer-product update).
 - the **exact single-step tables** (`§3.3` prefill, `§3.4` decode). These are
   the whole point of the report: they are what lets a reader find a hot kernel
   by name and diff two runs operator by operator. Build them from
@@ -498,6 +550,7 @@ number.
 | A decode graph replay is stamped *inside* the prefill window | prefill inflated by one decode step; 1153 kernels / 33.9 ms in the reference trace |
 | Sorting events by `(ts, dur, name)` instead of `ts` alone | destroys capture order under collapsed timestamps → layer walker desyncs |
 | Two sampler windows straddle one graph replay | those decode steps have fractional counts; use only the modal-size windows |
+| The replay lands **two** windows early, so the donor and the receiver together outnumber the intact windows | the modal size is a *broken* window (1209/404/2014 三周期 -> modal 404, decode measured as 11.9 ms instead of 31.9). `pick_decode_windows()` ranks by distance to the mean and keeps the first size whose Dense-GEMM count is exact |
 | AutoRound Hadamard matmuls are also called `gemm_kernel` | Dense-GEMM count inflated ~4x; discriminate on the work-group shape |
 | `in_proj_ba` is sometimes scheduled before `in_proj_qkvz` | one GDN layer's two projections swap; detect `ba` by its single-work-group ND-range |
 | The last `..._rms_norm_3` marker is the model's final norm, not a layer start | one phantom 65th layer that swallows `lm_head` |

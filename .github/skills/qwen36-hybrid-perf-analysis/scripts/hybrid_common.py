@@ -154,8 +154,10 @@ RE_QK_NORM_ROPE = re.compile(
     r"triton_poi_fused_0$|triton_red_fused_1$|triton_poi_fused_cat_neg|"
     r"triton_poi_fused__to_copy_cat_mul_5$")
 
-RE_GDN_DECODE = re.compile(r"gdn::causal_conv1d_kernel|gdn::gated_delta_rule_kernel")
-RE_GDN_CHUNK = re.compile(r"gdn::Chunk|gdn::chunk_update_states|gdn::tiled_kernel_launcher")
+RE_GDN_DECODE = re.compile(r"gdn::causal_conv1d_kernel|gdn::gated_delta_rule_kernel|"
+                           r"gdn::detail::recurrent::RecurrentGdnDecodeKernel")
+RE_GDN_CHUNK = re.compile(r"gdn::Chunk|gdn::chunk_update_states|gdn::tiled_kernel_launcher|"
+                          r"gdn::detail::Chunk")
 RE_FMHA_PREFILL = re.compile(r"XeFMHAFwdKernel")
 RE_FMHA_DECODE = re.compile(r"XeFMHAFwdSplitKVKernel")
 RE_FMHA_REDUCE = re.compile(r"ReduceSplitK")
@@ -180,6 +182,11 @@ RE_ND = re.compile(r"\[SIMD(\d+) \{(\d+); (\d+); (\d+)\} \{(\d+); (\d+); (\d+)\}
 MAIN_GEMM_LOCAL = {(128, 4, 1), (32, 2, 8)}
 DECODE_MAIN_LOCAL = (64, 8, 1)
 
+# a newer vllm-xpu-kernels build serves every quantised linear from CUTLASS-SYCL
+# (`MainloopIntelXeXMX16BlockScaled`, XMX fp8 MMA atom) instead of oneDNN
+# `gemm_kernel`; only in_proj_ba and the bf16 lm_head stay on oneDNN
+RE_CUTLASS_GEMM = re.compile(r"cutlass::gemm::kernel::GemmUniversal")
+
 
 def nd_range(name):
     m = RE_ND.search(name)
@@ -190,8 +197,12 @@ def nd_range(name):
     return g, l
 
 
+def is_cutlass_gemm(name):
+    return bool(RE_CUTLASS_GEMM.search(name))
+
+
 def is_gemm(name):
-    return name.startswith("gemm_kernel")
+    return name.startswith("gemm_kernel") or is_cutlass_gemm(name)
 
 
 def is_main_gemm(name, weight_dtype="mxfp4"):
@@ -201,6 +212,8 @@ def is_main_gemm(name, weight_dtype="mxfp4"):
     rotation_config, so there every gemm_kernel is a linear.
     """
     if weight_dtype in ("bf16", "mxfp8"):
+        return True
+    if is_cutlass_gemm(name):
         return True
     nd = nd_range(name)
     if nd is None:
@@ -353,6 +366,17 @@ def fused_hadamard_quant(evlist):
     return any("fwht_quant" in n for _, _, n in evlist)
 
 
+def fused_scale_cast(evlist):
+    """True when the quantise kernel writes the E8M0 scales itself.
+
+    A compressed-tensors MXFP8 build emits
+    `per_token_group_quant_8bit_vec_kernel<..., unsigned char>` -- the last
+    template argument is the scale type -- so no separate Float8_e8m0 cast runs.
+    """
+    return any("per_token_group_quant_8bit" in n and "unsigned char" in n
+               for _, _, n in evlist)
+
+
 def detect_prompt_len(evlist):
     """Prompt tokens in this window, from the KV-write ND-range (grid[0] == T).
 
@@ -381,6 +405,31 @@ def detect_batch(evs, wins, first=1):
                 if nd:
                     counts[nd[0][0]] += 1
     return counts.most_common(1)[0][0] if counts else None
+
+
+def pick_decode_windows(evs, wins, d0=1, cfg=CFG, weight_dtype="mxfp4"):
+    """(size, [window index, ...]) of the decode windows that hold a whole forward.
+
+    Not the modal kernel count: when a graph replay is stamped two windows early
+    the donor and the receiver are both off by the replay's size and together
+    can outnumber the intact windows.  The mean is unaffected by that shuffle,
+    so rank the sizes by distance to it and keep the first one whose Dense-GEMM
+    count is exact.
+    """
+    sizes = {}
+    for k, (lo, hi) in enumerate(wins[d0:], start=d0):
+        sizes.setdefault(hi - lo, []).append(k)
+    mean_sz = sum(hi - lo for lo, hi in wins[d0:]) / max(1, len(wins) - d0)
+    want_full = cfg["layers"] // cfg["full_attention_interval"]
+    want_gemm = (len(GDN_LINEARS[weight_dtype]) * (cfg["layers"] - want_full)
+                 + 4 * want_full + 1)
+    ranked = sorted(sizes, key=lambda s: (abs(s - mean_sz), -len(sizes[s])))
+    for s in ranked[:4]:
+        lo, hi = wins[sizes[s][0]]
+        _, tags = walk_layers(list(evs[lo:hi]), cfg, weight_dtype)
+        if len(tags) == want_gemm:
+            return s, sizes[s]
+    return ranked[0], sizes[ranked[0]]
 
 
 def prefill_window_indices(evs, wins):
@@ -539,6 +588,14 @@ def _split_in_proj_pair(evlist, tags):
     leaves the walker's answer alone and duration clustering remains the split.
     """
     idx = [i for i, t in tags.items() if t in ("in_proj_qkvz", "in_proj_ba")]
+    # CUTLASS build: in_proj_qkvz is a CUTLASS kernel and in_proj_ba stayed on
+    # oneDNN, which is exact in both phases -- grid[0] is not (decode inverts it)
+    fams = {is_cutlass_gemm(evlist[i][2]) for i in idx}
+    if len(fams) == 2:
+        for i in idx:
+            tags[i] = ("in_proj_qkvz" if is_cutlass_gemm(evlist[i][2])
+                       else "in_proj_ba")
+        return
     grids = {nd_range(evlist[i][2])[0][0] for i in idx if nd_range(evlist[i][2])}
     if len(grids) != 2:
         return

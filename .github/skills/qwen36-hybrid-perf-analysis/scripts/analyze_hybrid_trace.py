@@ -15,8 +15,10 @@ from collections import defaultdict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hybrid_common import (CATEGORY_ORDER, CFG, GDN_LINEARS, bucket,
                            detect_batch, detect_prompt_len,
-                           fused_hadamard_quant, gemm_nd_histogram, is_gemm,
+                           fused_hadamard_quant, fused_scale_cast,
+                           gemm_nd_histogram, is_gemm,
                            is_main_gemm, layer_kinds, load,
+                           pick_decode_windows,
                            prefill_window_indices, split_graph_blocks,
                            step_windows, ts_collapsed, walk_layers)
 
@@ -139,9 +141,11 @@ def sanity(evlist, layers, tags, phase, cfg, wd="mxfp4"):
         # in_proj_qkvz and in_proj_ba read the same hidden state and there is no
         # per-linear rotation, so one quantise launch feeds both
         n_quant -= want_gdn
-    # a fused fwht_quant kernel writes the E8M0 scales itself, so the separate
-    # cast kernel disappears -- still one quantise launch per quantised linear
-    n_cast = 0 if fused_hadamard_quant(evlist) else n_quant
+    # a fused fwht_quant kernel -- or the MXFP8 `..., unsigned char>` quantiser --
+    # writes the E8M0 scales itself, so the separate cast kernel disappears;
+    # still one quantise launch per quantised linear
+    n_cast = (0 if fused_hadamard_quant(evlist) or fused_scale_cast(evlist)
+              else n_quant)
     quant_cat = "Quantize(mxfp8)" if wd == "mxfp8" else "Quantize(mxfp4)"
     checks = [
         ("gdn layers", n_gdn, want_gdn),
@@ -280,12 +284,7 @@ def main():
         sanity(pre, players, ptags, "PREFILL", cfg, wd)
 
     # ---- decode --------------------------------------------------------
-    # pick a complete decode window: the modal kernel count
-    sizes = {}
-    for k, (lo, hi) in enumerate(wins[d0:], start=d0):
-        sizes.setdefault(hi - lo, []).append(k)
-    modal = max(sizes, key=lambda s: len(sizes[s]))
-    good = sizes[modal]
+    modal, good = pick_decode_windows(evs, wins, d0, cfg, wd)
     print(f"\ncomplete decode steps: {len(good)} of {len(wins)-d0} "
           f"({modal} kernels each); incomplete windows "
           f"{[k for k in range(d0, len(wins)) if k not in good]} are skipped "

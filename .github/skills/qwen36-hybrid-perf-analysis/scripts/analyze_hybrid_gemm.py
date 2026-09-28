@@ -20,6 +20,7 @@ from hybrid_common import (BF16_BYTES, CFG, RE_FMHA_DECODE,
                            RE_FMHA_PREFILL, RE_FMHA_REDUCE, RE_GDN_CHUNK,
                            RE_GDN_DECODE, derive, detect_batch,
                            detect_prompt_len, load, nd_range,
+                           pick_decode_windows,
                            prefill_window_indices, split_graph_blocks,
                            step_windows, walk_layers, weight_bytes)
 
@@ -295,11 +296,7 @@ def main():
               f"prefill split the prompt across several forward passes.")
         print("!! Window 0 is only the first chunk and the rest are counted as "
               "decode steps -- every number below is wrong.")
-    sizes = {}
-    for k, (lo, hi) in enumerate(wins[d0:], start=d0):
-        sizes.setdefault(hi - lo, []).append(k)
-    modal = max(sizes, key=lambda s: len(sizes[s]))
-    good = sizes[modal]
+    _, good = pick_decode_windows(evs, wins, d0, CFG, args.weight_dtype)
     dk = good[min(args.decode_step, len(good) - 1)]
     dec = list(evs[wins[dk][0]:wins[dk][1]])
 

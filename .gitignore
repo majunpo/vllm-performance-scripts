@@ -17,6 +17,7 @@ ldconfig.*.json
 rank*.pt.trace.json
 *.pt.trace.json
 *.pt.trace.json.gz
+*.perfetto.json
 *.perfetto.json.gz
 perfetto.log
 
@@ -34,6 +35,8 @@ xpu-vs-nv-comparison*.md
 analyze_*.txt
 analyze_*.err
 kernel-detail-*.txt
+prefill-kernel-flow*.txt
+prefill-flow*.md
 bench_mxfp4_vs_bf16.txt
 analysis.txt
 gemm_shapes.txt

@@ -14,7 +14,8 @@ import sys
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hybrid_common import CFG, bucket, load, split_graph_blocks, step_windows, walk_layers
+from hybrid_common import (CFG, bucket, load, pick_decode_windows,
+                           split_graph_blocks, step_windows, walk_layers)
 
 PID = 1
 TID_PHASE, TID_STEP, TID_LAYER, TID_KERNEL = 10, 11, 12, 13
@@ -74,6 +75,8 @@ def main():
     p.add_argument("-o", "--output",
                    help="output .json.gz (default: <trace>.perfetto.json.gz)")
     p.add_argument("--max-kernel-s", type=float, default=10.0)
+    p.add_argument("--weight-dtype", choices=("mxfp4", "mxfp8", "bf16"),
+                   default="mxfp4")
     p.add_argument("--graph-block-min", type=int, default=64)
     p.add_argument("--bin-ms", type=float, default=5.0,
                    help="counter track resolution (default: 5)")
@@ -86,6 +89,7 @@ def main():
 
     out_path = args.output or (os.path.splitext(args.trace)[0] + ".perfetto.json.gz")
     cfg = CFG
+    wd = args.weight_dtype
     raw = load(args.trace, args.max_kernel_s)
 
     stamps = Counter(e[0] for e in raw)
@@ -122,11 +126,8 @@ def main():
     meta("thread_name", "decoder layers (GDN / full attention)", TID_LAYER)
     meta("thread_name", "GPU kernels", TID_KERNEL)
 
-    sizes = defaultdict(list)
-    for k, (lo, hi) in enumerate(wins[1:], start=1):
-        sizes[hi - lo].append(k)
-    modal = max(sizes, key=lambda s: len(sizes[s]))
-    complete = set(sizes[modal])
+    _, good = pick_decode_windows(evs, wins, 1, cfg, wd)
+    complete = set(good)
 
     print(f"\n{'window':>7} {'start(ms)':>10} {'dur(ms)':>9}  label")
     for k, (lo, hi) in enumerate(wins):
@@ -148,7 +149,7 @@ def main():
               f"{(evs[hi-1][0]+evs[hi-1][1]-evs[lo][0])/1e3:>9.2f}  {label}")
 
         sub = [evs[i] for i in keep]
-        layers, _ = walk_layers(sub, cfg)
+        layers, _ = walk_layers(sub, cfg, wd)
         for n, (kind, s, e) in enumerate(layers):
             if kind == "head":
                 name, ln = "lm_head + sampler", None

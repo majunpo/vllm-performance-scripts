@@ -9,6 +9,7 @@
 | 目录 | 用途 |
 | --- | --- |
 | [`profile-scripts/`](profile-scripts/README.md) | 在 Intel XPU 或 NVIDIA GPU 上采集 torch profiler、unitrace，以及 prefill/decode trace |
+| [`kernel-bench-scripts/`](kernel-bench-scripts/README.md) | 单算子（kernel 级）benchmark，用于 XPU 与 NV 的逐算子对照 |
 | [`start-server-gsm8k-scripts/`](start-server-gsm8k-scripts/README.md) | 启动 vLLM OpenAI 兼容服务，并通过 lm-eval 或 vLLM evaluator 运行 GSM8K |
 | [`vllm-bench-scripts/`](vllm-bench-scripts/) | 批量运行 `vllm bench serve`，保存日志并将性能指标解析为 CSV |
 
