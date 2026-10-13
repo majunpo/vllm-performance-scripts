@@ -239,6 +239,35 @@ prefill 被切成 N 个 chunk，每个 chunk 一次前向，window 0 只是第�
 prefill 窗口里通常混着一次 decode 重放，bs>1 时那次重放的 KV-write grid 也 > 1，
 取第一个会拿到 batch 而不是 prompt 长度。
 
+## 16. DeepKLOX build：norm / SwiGLU 内融合 MXFP8 量化，采样是两个 kernel
+
+`...-261013-055608`（Qwen3.8-27B-MXFP8，vLLM 1941 + DeepKLOX）首次运行时 prefill 6 项 `BAD`、
+decode 被切成 40 个窗口。原因与处理（已写进 `hybrid_common.py`）：
+
+| 现象 | 处理 |
+|---|---|
+| `_gumbel_sample_kernel` 后面多一个 ArgMax `reduce_kernel`，每步多出一个只有 1 个 kernel 的窗口 | `step_windows()` 把只含采样 kernel 的窗口并入前一个 |
+| input norm 和 post-attn norm 都是 `vllm::quant_kernels_asm::rms_norm_mx_quant_kernel`，层终止 marker 失效 | `norm_roles()`：后面的 GEMM 接 `silu_and_mul_mxfp8_quant` → post，否则 → input；`<…, false, …>` 是 layer 0（无残差）；final norm 是 `triton_…_fused_add_rms_norm_<n>` |
+| SwiGLU 变成 `silu_and_mul_mxfp8_quant_kernel` | 归 Activation(SiLU)；Quantize 期望值变为 G+F（只剩 out_proj/o_proj 输入的 `per_token_group_quant_mxfp8_kernel`） |
+| attention output gate 融进了 piece 首个 Inductor kernel `triton_poi_fused_0`（这个名字在每个 piece 里含义不同） | `categorize()` 按前驱判定：紧跟 FMHA/ReduceSplitK → OutGate |
+| GDN gated norm 名字只剩 `triton_per_fused_1`；新增 `…linalg_vector_norm…` 的 gating kernel；decode conv1d 是 Triton `_conv1d_decode_kernel` | 分别归 GDN-Norm/Gate、GDN-Gating、GDN-Attn(recurrent) |
+| `lm_head` 在 decode 窗口里被打在 final norm 之前，被当成 `down_proj` | `_gemm_role()` 先按 `{32;2;8}` work-group 识别 `lm_head` |
+| `in_proj_a/b` 在 `ignore` 列表 → `in_proj_ba` 是 bf16 GEMM | `analyze_hybrid_gemm.py --bf16-in-proj-ba` |
+
+另外：中间的 decode 窗口按 462 / 1592 交替（一次 565-kernel 的重放被排到前一个窗口），只有首尾两步完整；
+做聚合时可把 window 1..N 与 prefill 里剔除的 replay kernel 一起求和再除以步数。
+
+## 17. DeepKLOX GDN prefill 与 SYCL-TLA GEMM（`...-261013-064257`）
+
+| 现象 | 处理 |
+|---|---|
+| `VLLM_XPU_GDN_PREFILL_DEEPKLOX=1` 后 GDN kernel 变成 `flash_xpu::(anonymous namespace)::CausalConvPrefillTiled*` 与 `cutlass::gdn::detail::deepklox::Chunk*`，落进 Other，`in_proj_qkvz` 也因为找不到消费者被当成 `qkv_proj` | `RE_GDN_CHUNK` 已覆盖；GDN 表的 key 去掉 `(anonymous namespace)::` |
+| SYCL-TLA 每个 linear 前多一个 `CopyScalarFunc<c10::Float8_e8m0fnu>`（激活 scale 重排，仅 prefill），被 `e8m0` 吃进 Quant-scale cast（192 → 448） | 新类别 `Quant-scale transpose`，排在 `RE_SCALE` 前 |
+| DeepKLOX 的 Python glue（padding 到 64 的倍数、gather、z copy、`D2D` 输出拷贝）落在 Elementwise / MemCopy / Other | 报告里单独汇总，否则 DeepKLOX 的收益被高估 |
+| `build_prefill_plan` 的 `.tolist()` 同步按 KV cache group 重复（本模型 3 次），每次 1.1–2.7 ms 空隙 | 只有 prefill 时间戳未塌缩时才能看到；看 `D2M[8]` → `M2D[16]` → `H2D[32256]` |
+
+两组 XPU 配置的 A/B：`compare_hybrid_perf.py --xpu <A>/analyze_hybrid_trace.txt --xpu-b <B>/analyze_hybrid_trace.txt`。
+
 ---
 
 # 分类口径

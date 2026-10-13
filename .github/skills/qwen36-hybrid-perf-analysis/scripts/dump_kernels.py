@@ -18,7 +18,7 @@ import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hybrid_common import (bucket, cluster_gemm_durations, load,
+from hybrid_common import (categorize, cluster_gemm_durations, load,
                            split_graph_blocks, step_windows, ts_collapsed,
                            walk_layers)
 
@@ -103,8 +103,7 @@ def main():
 
     cats = defaultdict(lambda: [0, 0.0])
     kern = defaultdict(lambda: [0, 0.0])
-    for _, d, name in sub:
-        c = bucket(name, a.weight_dtype)
+    for (_, d, name), c in zip(sub, categorize(sub, a.weight_dtype)):
         cats[c][0] += 1
         cats[c][1] += d
         kern[(c, name)][0] += 1

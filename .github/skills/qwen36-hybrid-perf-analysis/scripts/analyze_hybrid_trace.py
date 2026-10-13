@@ -13,10 +13,11 @@ import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hybrid_common import (CATEGORY_ORDER, CFG, GDN_LINEARS, bucket,
+from hybrid_common import (CATEGORY_ORDER, CFG, GDN_LINEARS, RE_NORM_QUANT,
+                           RE_SILU, base_name, bucket, categorize,
                            detect_batch, detect_prompt_len,
                            fused_hadamard_quant, fused_scale_cast,
-                           gemm_nd_histogram, is_gemm,
+                           gemm_nd_histogram, is_fused_norm_build, is_gemm,
                            is_main_gemm, layer_kinds, load,
                            pick_decode_windows,
                            prefill_window_indices, split_graph_blocks,
@@ -40,8 +41,7 @@ def short(name, width):
 def tally(evlist, wd="mxfp4"):
     cats = defaultdict(lambda: [0, 0.0])
     kern = defaultdict(lambda: [0, 0.0])
-    for _, dur, name in evlist:
-        c = bucket(name, wd)
+    for (_, dur, name), c in zip(evlist, categorize(evlist, wd)):
         cats[c][0] += 1
         cats[c][1] += dur
         kern[(c, name)][0] += 1
@@ -146,6 +146,16 @@ def sanity(evlist, layers, tags, phase, cfg, wd="mxfp4"):
     # still one quantise launch per quantised linear
     n_cast = (0 if fused_hadamard_quant(evlist) or fused_scale_cast(evlist)
               else n_quant)
+    if is_fused_norm_build(evlist):
+        # DeepKLOX: both norms and SwiGLU quantise in-kernel (billed to
+        # Norm(RMS) / Activation(SiLU)); only the out_proj/o_proj input keeps a
+        # standalone quantiser.  A cast follows every quantiser that writes
+        # float scales: SwiGLU always, the norm only in its `float>` instance
+        n_quant = want_gdn + want_full
+        n_cast = sum(1 for _, _, n in evlist
+                     if RE_SILU.search(base_name(n))
+                     or (RE_NORM_QUANT.search(n)
+                         and base_name(n).endswith("float>")))
     quant_cat = "Quantize(mxfp8)" if wd == "mxfp8" else "Quantize(mxfp4)"
     checks = [
         ("gdn layers", n_gdn, want_gdn),
@@ -301,8 +311,8 @@ def main():
     dtotal = 0.0
     for k in good:
         lo, hi = wins[k]
-        for _, dur, name in evs[lo:hi]:
-            c = bucket(name, wd)
+        w = evs[lo:hi]
+        for (_, dur, name), c in zip(w, categorize(w, wd)):
             dagg[c][0] += 1
             dagg[c][1] += dur
             dtotal += dur

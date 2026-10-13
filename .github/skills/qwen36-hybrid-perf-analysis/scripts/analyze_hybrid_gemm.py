@@ -87,9 +87,11 @@ def report_gemm(durs, cfg, shapes, m, phase, layers_of, wd="mxfp4"):
             quant_t += sum(d)
             quant_b += byts * cnt
         if phase == "decode":
+            # unitrace occasionally records dur=0 for a replayed kernel
+            dmin = next((x for x in d if x > 0), med)
             rows.append(f"{tag:<14} {k:>6} {n:>7} {cnt:>6} {med:>9.2f} "
-                        f"{d[0]:>9.2f} {byts/1e6:>8.2f} {byts/med/1e3:>9.1f} "
-                        f"{byts/d[0]/1e3:>9.1f} {sum(d)/1e3:>8.3f}")
+                        f"{dmin:>9.2f} {byts/1e6:>8.2f} {byts/med/1e3:>9.1f} "
+                        f"{byts/dmin/1e3:>9.1f} {sum(d)/1e3:>8.3f}")
         else:
             rows.append(f"{tag:<14} {mm:>6} {k:>6} {n:>7} {cnt:>6} {med:>9.1f} "
                         f"{flops/1e9:>9.1f} {byts/1e6:>8.1f} "
@@ -162,6 +164,7 @@ def report_gdn(evlist, cfg, batch, tokens, phase):
     for _, dur, name in evlist:
         if RE_GDN_DECODE.search(name) or RE_GDN_CHUNK.search(name):
             base = name[:name.rfind("[")] if name.rfind("[") > 0 else name
+            base = base.replace("(anonymous namespace)::", "")
             key = base.split("<")[0].split("(")[0]
             rows[key][0] += 1
             rows[key][1] += dur
@@ -175,6 +178,8 @@ def report_gdn(evlist, cfg, batch, tokens, phase):
             f"state {2*state/1e6:.2f} MB rd+wr/layer",
         "gdn::causal_conv1d_kernel":
             f"conv state {2*conv_state/1e3:.1f} KB rd+wr/layer",
+        "_conv1d_decode_kernel":
+            f"Triton conv1d decode, conv state {2*conv_state/1e3:.1f} KB rd+wr/layer",
         "gdn::ChunkInverseKernel": "UT-transform inverse (serial, 32-wide WG)",
         "gdn::ChunkComputeWUKernel": "W/U projection",
         "gdn::ChunkFwdOKernel": "intra+inter chunk output",
@@ -182,6 +187,11 @@ def report_gdn(evlist, cfg, batch, tokens, phase):
         "gdn::tiled_kernel_launcher": "chunked causal conv1d",
         "gdn::ChunkPrepareKernel": "cumulative decay",
         "gdn::chunk_update_states_kernel": "carry state between chunks",
+        "cutlass::gdn::detail::deepklox::ChunkComputeAO2InvKernel":
+            "DeepKLOX: Prepare+A+Inverse+WU fused",
+        "cutlass::gdn::detail::deepklox::ChunkFwdOKernel": "DeepKLOX: chunk output",
+        "flash_xpu::CausalConvPrefillTiledKernel": "DeepKLOX: chunked causal conv1d",
+        "flash_xpu::CausalConvPrefillTiledStateKernel": "DeepKLOX: conv state write-back",
     }
     for k, (c, d) in sorted(rows.items(), key=lambda x: -x[1][1]):
         print(f"{k:<34} {c:>6} {d/1e3:>9.4f} {d/c:>9.2f} {d/tot*100:>6.2f}%   "
@@ -259,11 +269,16 @@ def main():
                         "best GEMM observed on the same device")
     p.add_argument("--ref-tflops", type=float, default=0.0,
                    help="reference achievable dense TFLOPS on the same device")
+    p.add_argument("--bf16-in-proj-ba", action="store_true",
+                   help="in_proj_a/in_proj_b are in the checkpoint's quantization "
+                        "`ignore` list, so in_proj_ba is a bf16 GEMM")
     args = p.parse_args()
 
     cfg = CFG
     wd = args.weight_dtype
     shapes = derive(cfg, wd)
+    if args.bf16_in_proj_ba and "in_proj_ba" in shapes:
+        shapes["in_proj_ba"] = shapes["in_proj_ba"][:2] + (False,)
     evs = load(args.trace, args.max_kernel_s, verbose=False)
     wins = step_windows(evs)
     d0 = 0 if args.decode_only else 1

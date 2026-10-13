@@ -143,7 +143,19 @@ RE_NORM_POST = re.compile(r"_fused_add_rms_norm(_mm_view)?_1$")
 RE_GDN_GATED_NORM = re.compile(
     r"rsqrt_silu(_t)?_view_0$|rsqrt_silu(_t)?_view_xpu_mxfp[48]_quantize_[0-9]+$")
 RE_FULL_OUT_GATE = re.compile(r"fused_(mm_)?mul_sigmoid_view_0$")
-RE_SILU = re.compile(r"fused_(mm_)?mul_silu_slice(_view)?_2$")
+RE_SILU = re.compile(r"fused_(mm_)?mul_silu_slice(_view)?_2$|silu_and_mul_mxfp[48]_quant")
+
+# DeepKLOX build: residual-add + RMSNorm + MXFP8 quantise in one kernel, used for
+# both the input and the post-attention norm (the role comes from context, see
+# norm_roles()); the model's final norm stays an Inductor bf16 kernel
+RE_NORM_QUANT = re.compile(r"rms_norm_mx_quant_kernel")
+RE_NORM_QUANT_FIRST = re.compile(r"rms_norm_mx_quant_kernel<[^,]+, [^,]+, false,")
+RE_FINAL_NORM = re.compile(r"_fused_add_rms_norm_[0-9]+$")
+# DeepKLOX build: Inductor names the GDN gated norm only by its piece-local index
+RE_GDN_GATED_NORM_BARE = re.compile(r"^triton_per_fused_1$")
+# DeepKLOX build: per-token norm + [T, v_heads] pointwise on the in_proj_ba output
+RE_GDN_GATING = re.compile(r"^triton_(red|poi)_fused_\w*linalg_vector_norm")
+RE_PIECE_HEAD = re.compile(r"^triton_poi_fused_0$")
 RE_GDN_STATE = re.compile(r"triton_poi_fused_zeros_[0-9]+$")
 RE_GDN_CAT = re.compile(r"triton_poi_fused_cat_[0-9]+$")
 
@@ -152,18 +164,21 @@ RE_QK_NORM_ROPE = re.compile(
     r"triton_poi_fused_arange_bitwise_and_eq_index_lt_remainder_select_split_where_6$|"
     r"triton_poi_fused_7$|"
     r"triton_poi_fused_0$|triton_red_fused_1$|triton_poi_fused_cat_neg|"
-    r"triton_poi_fused__to_copy_cat_mul_5$")
+    r"triton_poi_fused__to_copy_cat_mul_5$|_fused_qk_rmsnorm_rope_gate_kernel")
 
 RE_GDN_DECODE = re.compile(r"gdn::causal_conv1d_kernel|gdn::gated_delta_rule_kernel|"
-                           r"gdn::detail::recurrent::RecurrentGdnDecodeKernel")
+                           r"gdn::detail::recurrent::RecurrentGdnDecodeKernel|"
+                           r"^_conv1d_decode_kernel")
 RE_GDN_CHUNK = re.compile(r"gdn::Chunk|gdn::chunk_update_states|gdn::tiled_kernel_launcher|"
-                          r"gdn::detail::Chunk")
+                          r"gdn::detail::(deepklox::)?Chunk|CausalConvPrefillTiled")
 RE_FMHA_PREFILL = re.compile(r"XeFMHAFwdKernel")
 RE_FMHA_DECODE = re.compile(r"XeFMHAFwdSplitKVKernel")
 RE_FMHA_REDUCE = re.compile(r"ReduceSplitK")
 RE_QUANT = re.compile(r"per_token_group_quant_mxfp4|_quant_|quantize|float_e2m1|fp4",
                       re.IGNORECASE)
 RE_SCALE = re.compile(r"Float8_e8m0|e8m0")
+# SYCL-TLA GEMM wants the activation scales in the other layout: one e8m0 copy per linear
+RE_SCALE_COPY = re.compile(r"CopyScalarFunc<c10::Float8_e8m0fnu>")
 RE_KVWRITE = re.compile(r"reshape_and_cache")
 RE_SAMPLE = re.compile(r"ArgMax|argmax|top_k_top_p|_gumbel_sample|Sampler")
 RE_SCHED = re.compile(r"slot_mapping|block_table|_prepare_|_post_update|"
@@ -253,10 +268,20 @@ def bucket(full, weight_dtype="mxfp4"):
         return "KVCache-Write"
     # before RE_QUANT: newer builds fuse the next linear's Hadamard+quantise
     # into the GDN gated-norm kernel, so its name matches both
-    if RE_GDN_GATED_NORM.search(name):
+    if RE_GDN_GATED_NORM.search(name) or RE_GDN_GATED_NORM_BARE.search(name):
         return "GDN-Norm/Gate"
+    # before RE_QUANT: DeepKLOX fuses the quantise into the norm / SwiGLU, the
+    # kernel is billed to the op it replaces (as the GDN gated norm above)
+    if RE_NORM_QUANT.search(name):
+        return "Norm(RMS)"
+    if RE_SILU.search(name):
+        return "Activation(SiLU)"
+    if RE_GDN_GATING.search(name):
+        return "GDN-Gating"
     if RE_QUANT.search(name):
         return "Quantize(mxfp8)" if weight_dtype == "mxfp8" else "Quantize(mxfp4)"
+    if RE_SCALE_COPY.search(name):
+        return "Quant-scale transpose"
     if RE_SCALE.search(name):
         return "Quant-scale cast"
     if RE_FULL_OUT_GATE.search(name):
@@ -286,10 +311,38 @@ CATEGORY_ORDER = [
     "Dense-GEMM", "GDN-Attn(chunk)", "GDN-Attn(recurrent)", "FullAttn-FMHA",
     "FullAttn-SplitK-Reduce", "Hadamard-Rotation", "Quantize(mxfp4)",
     "Quantize(mxfp8)",
-    "Quant-scale cast", "Norm(RMS)", "GDN-Norm/Gate", "QK-Norm/RoPE",
+    "Quant-scale cast", "Quant-scale transpose", "Norm(RMS)", "GDN-Norm/Gate",
+    "QK-Norm/RoPE",
     "Activation(SiLU)", "FullAttn-OutGate", "KVCache-Write", "GDN-State-Init",
-    "Sampling", "Sched/Prep", "MemCopy", "Elementwise/Layout", "Other",
+    "GDN-Gating", "Sampling", "Sched/Prep", "MemCopy", "Elementwise/Layout",
+    "Other",
 ]
+
+
+def is_fused_norm_build(evlist):
+    """DeepKLOX build: norm / SwiGLU carry the MXFP8 quantise inside."""
+    return any(RE_NORM_QUANT.search(n) for _, _, n in evlist)
+
+
+def categorize(evlist, weight_dtype="mxfp4"):
+    """bucket() for every kernel of a window, plus the context-dependent ones.
+
+    In a DeepKLOX piecewise build the attention output gate is fused into the
+    first Inductor kernel of the piece that follows FMHA, `triton_poi_fused_0`,
+    a name every piece reuses for something else.  Only its predecessor tells
+    them apart.
+    """
+    cats = [bucket(n, weight_dtype) for _, _, n in evlist]
+    if not is_fused_norm_build(evlist):
+        return cats
+    for i, (_, _, n) in enumerate(evlist):
+        if not RE_PIECE_HEAD.search(base_name(n)):
+            continue
+        prev = cats[i - 1] if i else ""
+        cats[i] = ("FullAttn-OutGate" if prev in ("FullAttn-FMHA",
+                                                  "FullAttn-SplitK-Reduce")
+                   else "Other")
+    return cats
 
 
 # --------------------------------------------------------------------------
@@ -324,11 +377,19 @@ def load(path, max_kernel_s=10.0, verbose=True):
 
 
 def step_windows(evs):
-    """Sampler-delimited forward passes.  Window 0 contains the prefill."""
+    """Sampler-delimited forward passes.  Window 0 contains the prefill.
+
+    A sampler may be several kernels (`_gumbel_sample_kernel` + an ArgMax
+    reduce); a window holding nothing but sampler kernels is the tail of the
+    previous one, not a forward pass.
+    """
     ends = [i for i, (_, _, n) in enumerate(evs) if RE_SAMPLE.search(n)]
     wins, prev = [], 0
     for e in ends:
-        wins.append((prev, e + 1))
+        if wins and all(RE_SAMPLE.search(n) for _, _, n in evs[prev:e + 1]):
+            wins[-1] = (wins[-1][0], e + 1)
+        else:
+            wins.append((prev, e + 1))
         prev = e + 1
     return wins
 
@@ -536,8 +597,8 @@ def walk_layers(evlist, cfg=CFG, weight_dtype="mxfp4"):
     KV-write), not from the marker name: the MXFP4 build emits two distinct norm
     kernels for the two layer types but the BF16 build collapses them into one.
     """
-    marks = [i for i, (_, _, n) in enumerate(evlist)
-             if RE_NORM_IN.search(base_name(n))]
+    roles = norm_roles(evlist)
+    marks = sorted(i for i, r in roles.items() if r == "in")
     if not marks:
         return [], {}
     bounds = [(0, marks[0] + 1)]
@@ -573,9 +634,51 @@ def walk_layers(evlist, cfg=CFG, weight_dtype="mxfp4"):
         if not is_gemm(name) or not is_main_gemm(name, weight_dtype):
             continue
         tags[i] = _gemm_role(evlist, i, kind_at.get(i, "gdn"), weight_dtype,
-                             order)
+                             order, roles)
     _split_in_proj_pair(evlist, tags)
     return layers, tags
+
+
+def norm_roles(evlist):
+    """{index: 'in' | 'post'} for every norm that can end or split a layer.
+
+    'in' is the residual add + the *next* layer's input norm (or the model's
+    final norm) and terminates a layer; 'post' is the post-attention norm.
+    Older builds name the two differently.  A DeepKLOX build emits the same
+    `rms_norm_mx_quant_kernel` for both, so the role comes from what the norm
+    feeds: the post-attention norm feeds gate_up, whose consumer is SwiGLU.
+    The `<..., false, ...>` instance has no residual input -- layer 0's input
+    norm, which starts rather than ends a segment.
+    """
+    roles = {}
+    if not is_fused_norm_build(evlist):
+        for i, (_, _, n) in enumerate(evlist):
+            b = base_name(n)
+            if RE_NORM_IN.search(b):
+                roles[i] = "in"
+            elif RE_NORM_POST.search(b):
+                roles[i] = "post"
+        return roles
+    for i, (_, _, n) in enumerate(evlist):
+        b = base_name(n)
+        if RE_FINAL_NORM.search(b):
+            roles[i] = "in"
+        elif RE_NORM_QUANT.search(b) and not RE_NORM_QUANT_FIRST.search(b):
+            roles[i] = _fused_norm_role(evlist, i)
+    return roles
+
+
+def _fused_norm_role(evlist, i, lookahead=8):
+    seen_gemm = False
+    for j in range(i + 1, min(i + 1 + lookahead, len(evlist))):
+        n = base_name(evlist[j][2])
+        if is_gemm(n):
+            seen_gemm = True
+            continue
+        if not seen_gemm or RE_SCALE.search(n) or RE_MEMCPY.search(n):
+            continue
+        return "post" if RE_SILU.search(n) else "in"
+    return "in"
 
 
 def _split_in_proj_pair(evlist, tags):
@@ -617,7 +720,7 @@ def _segment_kind(evlist, lo, hi):
     return None
 
 
-def _gemm_role(evlist, i, kind, weight_dtype, order, lookahead=48):
+def _gemm_role(evlist, i, kind, weight_dtype, order, roles=None, lookahead=48):
     """Name a linear from the op that consumes its output.
 
     Positional assignment inside a layer segment breaks whenever the graph
@@ -627,17 +730,24 @@ def _gemm_role(evlist, i, kind, weight_dtype, order, lookahead=48):
     immune to that, and gives the same answer for both checkpoints.
     """
     consumers = order.get(kind, [])
+    roles = roles if roles is not None else norm_roles(evlist)
+    # the bf16 lm_head keeps its own oneDNN work-group even inside a replay;
+    # a DeepKLOX decode window can stamp it before the final norm
+    nd = nd_range(evlist[i][2])
+    if nd and nd[1] == (32, 2, 8):
+        return "lm_head"
     for j in range(i + 1, min(i + lookahead, len(evlist))):
         n = base_name(evlist[j][2])
         if RE_SILU.search(n):
             return "gate_up"
-        if RE_NORM_IN.search(n):
+        if roles.get(j) == "in":
             return "down_proj"
-        if RE_NORM_POST.search(n) or RE_FULL_OUT_GATE.search(n) \
+        if roles.get(j) == "post" or RE_FULL_OUT_GATE.search(n) \
                 or RE_GDN_GATED_NORM.search(n):
             return "gdn_out_proj" if kind == "gdn" else "o_proj"
         if RE_GDN_DECODE.search(n) or RE_GDN_CHUNK.search(n) \
-                or RE_GDN_CAT.search(n) or RE_GDN_STATE.search(n):
+                or RE_GDN_CAT.search(n) or RE_GDN_STATE.search(n) \
+                or RE_GDN_GATING.search(n):
             if weight_dtype == "bf16":
                 return "in_proj"
             return "in_proj_ba" if is_tiny_gemm(evlist[i][2]) else "in_proj_qkvz"

@@ -205,7 +205,7 @@ def parse_xpu(trace_txt, gemm_txt):
             d["aggregate"]["prefill_tflops"] = float(m.group(1)) if m else None
         m = re.search(r"aggregate\s+: [\d.]+ ms.*?\n\s+([\d.]+) GB/s", g)
         d["aggregate"]["decode_gbs"] = float(m.group(1)) if m else None
-        m = re.search(r"^MXFP4 linears\s+: ([\d.]+) ms, ([\d.]+) GiB -> ([\d.]+) GB/s",
+        m = re.search(r"^MXFP[48] linears\s+: ([\d.]+) ms, ([\d.]+) GiB -> ([\d.]+) GB/s",
                       g, re.M)
         if m:
             d["aggregate"]["decode_quant_ms"] = float(m.group(1))
@@ -418,7 +418,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--xpu", required=True, help="analyze_hybrid_trace.txt")
     p.add_argument("--xpu-gemm", help="analyze_hybrid_gemm.txt (per-shape tables)")
-    p.add_argument("--nv", required=True, help="analyze_nv_hybrid_trace.txt")
+    p.add_argument("--nv", help="analyze_nv_hybrid_trace.txt")
+    p.add_argument("--xpu-b", help="B side is another XPU run: its "
+                   "analyze_hybrid_trace.txt (A/B of two XPU configurations)")
+    p.add_argument("--xpu-b-gemm", help="analyze_hybrid_gemm.txt of the B run")
+    p.add_argument("--xpu-b-backend", default="—",
+                   help="B-side GEMM backend label (--xpu-b only)")
     p.add_argument("--xpu-name", default="Intel XPU")
     p.add_argument("--nv-name", default="NVIDIA")
     p.add_argument("--xpu-backend", default="—",
@@ -431,6 +436,8 @@ def main():
                         "an existing comparison")
     a = p.parse_args()
 
+    if bool(a.nv) == bool(a.xpu_b):
+        sys.exit("pass exactly one of --nv / --xpu-b")
     if os.path.exists(a.output):
         sys.exit(f"{a.output} already exists -- comparisons are kept so two runs "
                  f"can be diffed; pick a new -o (suffix it with the XPU trace "
@@ -440,7 +447,17 @@ def main():
         a.xpu_gemm = cand if os.path.exists(cand) else None
 
     x = parse_xpu(a.xpu, a.xpu_gemm)
-    n = parse_nv(a.nv)
+    if a.xpu_b:
+        if not a.xpu_b_gemm:
+            cand = os.path.join(os.path.dirname(a.xpu_b), "analyze_hybrid_gemm.txt")
+            a.xpu_b_gemm = cand if os.path.exists(cand) else None
+        n = parse_xpu(a.xpu_b, a.xpu_b_gemm)
+        for rows in n["gemm"].values():
+            for r in rows.values():
+                r["backend"] = a.xpu_b_backend
+    else:
+        n = parse_nv(a.nv)
+    b_src = a.xpu_b or a.nv
 
     if x.get("tokens") and n.get("tokens") and x["tokens"] != n["tokens"]:
         print(f"WARNING: prompt length differs ({x['tokens']} vs {n['tokens']}) "
@@ -461,14 +478,15 @@ def main():
          f"**生成方式**：`qwen36-hybrid-perf-analysis/scripts/compare_hybrid_perf.py`"
          f"（§1–§4 自动生成，§0/§5/§6 需人工补充）", "",
          f"- A = **{A}** ← `{os.path.relpath(a.xpu)}`",
-         f"- B = **{B}** ← `{os.path.relpath(a.nv)}`"
+         f"- B = **{B}** ← `{os.path.relpath(b_src)}`"
          + (f"（{n['device']}）" if n.get("device") else ""), "", "---", ""]
 
     o += ["## 0. 对比基准（人工填写）", "",
           "| | " + A + " | " + B + " |", "|---|---|---|",
           "| 设备 | <型号 / 架构 / 计算单元数 / 显存> | "
           + (n.get("device") or "<型号>") + " |",
-          "| Trace | <文件名>（unitrace） | <文件名>（PyTorch Profiler） |",
+          "| Trace | <文件名>（unitrace） | <文件名>（"
+          + ("unitrace" if a.xpu_b else "PyTorch Profiler") + "） |",
           "| 模型 | <layers / hidden / inter / vocab / GDN 与 full 的拆分> | 同左 |",
           "| 权重+激活量化 | <格式，group size，W?A?> | <格式，是否 MIXED_PRECISION> |",
           "| GEMM 后端 | "
@@ -565,7 +583,7 @@ def main():
         best_n = max((v["metric"] for v in n["gemm"]["decode"].values()), default=None)
         # a BF16 XPU trace has no separate quantised-linear line
         xq_gbs = x["aggregate"].get("decode_quant_gbs") or x["aggregate"].get("decode_gbs")
-        nq_gbs = n["aggregate"].get("decode_gbs")
+        nq_gbs = n["aggregate"].get("decode_quant_gbs") or n["aggregate"].get("decode_gbs")
         o += [f"| 本平台最佳 shape 带宽 | {f(best_x, '.1f')} GB/s | {f(best_n, '.1f')} GB/s |",
               f"| 主干 linear 聚合实测（有量化则取量化 linear） | {f(xq_gbs, '.1f')} GB/s | "
               f"{f(nq_gbs, '.1f')} GB/s |",
