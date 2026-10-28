@@ -150,12 +150,13 @@ def sanity(evlist, layers, tags, phase, cfg, wd="mxfp4"):
         # DeepKLOX: both norms and SwiGLU quantise in-kernel (billed to
         # Norm(RMS) / Activation(SiLU)); only the out_proj/o_proj input keeps a
         # standalone quantiser.  A cast follows every quantiser that writes
-        # float scales: SwiGLU always, the norm only in its `float>` instance
+        # float scales: SwiGLU always, the norm unless it writes `unsigned char`
+        # scales (newer builds drop the scale type from the template entirely)
         n_quant = want_gdn + want_full
         n_cast = sum(1 for _, _, n in evlist
                      if RE_SILU.search(base_name(n))
                      or (RE_NORM_QUANT.search(n)
-                         and base_name(n).endswith("float>")))
+                         and not base_name(n).endswith("unsigned char>")))
     quant_cat = "Quantize(mxfp8)" if wd == "mxfp8" else "Quantize(mxfp4)"
     checks = [
         ("gdn layers", n_gdn, want_gdn),

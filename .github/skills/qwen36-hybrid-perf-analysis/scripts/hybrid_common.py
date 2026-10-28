@@ -167,10 +167,12 @@ RE_QK_NORM_ROPE = re.compile(
     r"triton_poi_fused__to_copy_cat_mul_5$|_fused_qk_rmsnorm_rope_gate_kernel")
 
 RE_GDN_DECODE = re.compile(r"gdn::causal_conv1d_kernel|gdn::gated_delta_rule_kernel|"
-                           r"gdn::detail::recurrent::RecurrentGdnDecodeKernel|"
-                           r"^_conv1d_decode_kernel")
+                           r"gdn::detail::recurrent::RecurrentGdn(Decode)?Kernel|"
+                           r"^_conv1d_decode_kernel|"
+                           r"causal_conv1d::detail::CausalConv1dUpdateKernel")
 RE_GDN_CHUNK = re.compile(r"gdn::Chunk|gdn::chunk_update_states|gdn::tiled_kernel_launcher|"
-                          r"gdn::detail::(deepklox::)?Chunk|CausalConvPrefillTiled")
+                          r"gdn::detail::(deepklox::)?Chunk|CausalConvPrefillTiled|"
+                          r"causal_conv1d::detail::CausalConv1d(Fwd|CommitState)Kernel")
 RE_FMHA_PREFILL = re.compile(r"XeFMHAFwdKernel")
 RE_FMHA_DECODE = re.compile(r"XeFMHAFwdSplitKVKernel")
 RE_FMHA_REDUCE = re.compile(r"ReduceSplitK")
@@ -480,11 +482,14 @@ def pick_decode_windows(evs, wins, d0=1, cfg=CFG, weight_dtype="mxfp4"):
     sizes = {}
     for k, (lo, hi) in enumerate(wins[d0:], start=d0):
         sizes.setdefault(hi - lo, []).append(k)
-    mean_sz = sum(hi - lo for lo, hi in wins[d0:]) / max(1, len(wins) - d0)
+    # median, not mean: the window cut by trace stop is far too small and drags
+    # the mean onto a neighbouring off-by-a-few window
+    all_sz = sorted(hi - lo for lo, hi in wins[d0:])
+    mid_sz = all_sz[len(all_sz) // 2] if all_sz else 0
     want_full = cfg["layers"] // cfg["full_attention_interval"]
     want_gemm = (len(GDN_LINEARS[weight_dtype]) * (cfg["layers"] - want_full)
                  + 4 * want_full + 1)
-    ranked = sorted(sizes, key=lambda s: (abs(s - mean_sz), -len(sizes[s])))
+    ranked = sorted(sizes, key=lambda s: (abs(s - mid_sz), -len(sizes[s])))
     for s in ranked[:4]:
         lo, hi = wins[sizes[s][0]]
         _, tags = walk_layers(list(evs[lo:hi]), cfg, weight_dtype)
